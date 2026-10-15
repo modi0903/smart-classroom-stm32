@@ -1,0 +1,16 @@
+# build output
+build/
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.exe
+# editor / IDE
+.vscode/
+*.svd
+# host-side binaries and renders
+tests/host_test
+tools/oled-sim/out/
+tools/oled-sim/sim
+tools/oled-sim/buttons
