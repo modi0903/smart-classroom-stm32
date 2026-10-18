@@ -1,25 +1,33 @@
 /*
  * Smart Classroom, Nucleo-F401RE, bare metal CMSIS, no HAL.
  * 2 zones: HC-SR04 occupancy + class-light LED each, shared DHT11 + OLED,
- * LM393 module for the AUTO mode's darkness check, RC522 RFID reader at the door.
+ * LM393 module for the AUTO mode's darkness check, RC522 RFID reader at the
+ * door, one pot dimming both LEDs, on-chip RTC for the clock.
  *
- * Zone A  TRIG PA10 (D2)   ECHO PB3 (D3)   LED PC7 (D9)  TIM3_CH2
- * Zone B  TRIG PB5  (D4)   ECHO PB4 (D5)   LED PB6 (D10) TIM4_CH1
+ * Zone A  TRIG PA10 (D2)   ECHO PB3 (D3)   LED PC7 (D9)   TIM3_CH2
+ * Zone B  TRIG PB5  (D4)   ECHO PB4 (D5)   LED PB6 (D10)  TIM4_CH1
  * DHT11   PA9 (D8)
  * OLED    SCL PB8 (D15)  SDA PB9 (D14), I2C1
  * LDR     PB0 (A3), LM393 DO pin, HIGH = dark on this module
  * RC522   SPI2: SCK PB13  MISO PB14  MOSI PB15  SDA(SS) PB12  RST PC5   3V3 ONLY
+ * POT     wiper on PA0 (A0), ends on 3V3 and GND, ADC1 channel 0
+ * BUTTON  B1 (blue, on the board), PC13, EXTI line 13 interrupt
  * HC-SR04 on 5V, everything else 3V3, grounds common.
  *
- * Each zone's mode (OFF/AUTO/DIM/MAX) is a #define below. Occupancy is
- * debounced: needs OCC_MS of continuous detection to go occupied, VACANT_MS
- * of continuous clear to go back to empty. Tapping a card at the door toggles
- * that card in/out of the headcount; a tap-in also makes both zones count as
- * occupied for ENTRY_BOOST_MS so the lights are on before the debounce
- * catches up.
+ * Each zone's mode (OFF/AUTO/DIM/MAX) is a #define below; the pot sets how
+ * bright "on" is, the blue button cycles a manual override AUTO -> ON -> OFF.
+ * Occupancy is debounced: needs OCC_MS of continuous detection to go
+ * occupied, VACANT_MS of continuous clear to go back to empty. Tapping a card
+ * at the door toggles that card in/out of the headcount; a tap-in also makes
+ * both zones count as occupied for ENTRY_BOOST_MS.
  *
- * HSI 16MHz, no PLL, no interrupts. UART2 prints raw state every loop for
- * debugging and LD2 toggles as a heartbeat. Headcount logic lives in logic.h.
+ * Clock: on-chip RTC, 32.768 kHz LSE crystal (falls back to the rough LSI if
+ * the crystal is missing). Set from the build time on flashing; set it exactly
+ * over the serial port with "T 08:30:00" and "D 18/10/26".
+ *
+ * Interrupts: EXTI15_10 (button) and USART2 RX (serial commands). Everything
+ * else is polled. HSI 16MHz, no PLL. UART2 prints raw state every loop and
+ * LD2 toggles as a heartbeat. Pure logic lives in logic.h (host tested).
  */
 
 #include "stm32f4xx.h"
@@ -29,6 +37,9 @@
 
 #define ZONE_A_MODE 1   /* 0 off, 1 auto, 2 dim, 3 max */
 #define ZONE_B_MODE 1
+#ifndef USE_POT
+#define USE_POT     1   /* 0 until the pot is wired, or A0 floats and brightness wanders */
+#endif
 
 #define OCC_CM      100
 #define OCC_MS      5000
@@ -40,6 +51,9 @@
 #define ENTRY_BOOST_MS 30000UL       /* after a tap-in, both zones count as occupied */
 #define TAP_LOCKOUT_MS 3000UL        /* same card ignored this long after a sighting */
 #define STALE_RESET_MS 120000UL      /* headcount > 0 but zones empty this long: clear it */
+#define POT_SAMPLES    8             /* ADC reads averaged per pot reading */
+#define BTN_DEBOUNCE_US 250000UL     /* ignore button edges closer than this */
+#define RX_QUIET_US    5000000UL     /* hold the status line this long after you type */
 
 #define DIST_NO_ECHO 0xFFFE
 #define DIST_FAR     0xFFFF
@@ -101,6 +115,64 @@ static void uart_putu(uint32_t v) {
 static void uart_puthex8(uint8_t v) {
   const char *h = "0123456789ABCDEF";
   uart_putc(h[v >> 4]); uart_putc(h[v & 15]);
+}
+
+/* ---------- interrupt-fed state ---------- */
+/* USART2 RX: the ISR drops each byte into a ring buffer, main() reads it. */
+#define RX_SIZE 64
+static volatile uint8_t  rx_buf[RX_SIZE];
+static volatile uint8_t  rx_head;            /* written only by the ISR  */
+static volatile uint8_t  rx_tail;            /* written only by main()   */
+static volatile uint32_t rx_last_us;
+static volatile bool     rx_any;             /* anything typed since boot */
+
+/* Blue button: the ISR only counts presses; main() decides what they mean. */
+static volatile uint32_t btn_presses;
+static volatile uint32_t btn_last_us;
+
+void USART2_IRQHandler(void) {
+  uint32_t sr = USART2->SR;
+  if (sr & (USART_SR_RXNE | USART_SR_ORE)) {
+    uint8_t c = (uint8_t)USART2->DR;         /* reading DR clears RXNE and ORE */
+    uint8_t next = (uint8_t)((rx_head + 1) % RX_SIZE);
+    if (next != rx_tail) { rx_buf[rx_head] = c; rx_head = next; }   /* full: drop */
+    rx_last_us = TIM2->CNT;
+    rx_any = true;
+  }
+}
+
+void EXTI15_10_IRQHandler(void) {
+  if (EXTI->PR & (1U << 13)) {
+    EXTI->PR = (1U << 13);                   /* write 1 to clear the pending flag */
+    uint32_t now = TIM2->CNT;
+    if (now - btn_last_us >= BTN_DEBOUNCE_US) { btn_presses++; btn_last_us = now; }
+  }
+}
+
+static void uart_rx_init(void) {
+  pin_t rx = {GPIOA, 3};
+  pin_af(rx, 7); pin_mode(rx, 2);
+  USART2->CR1 |= USART_CR1_RE | USART_CR1_RXNEIE;
+  NVIC_EnableIRQ(USART2_IRQn);
+}
+
+static void button_init(void) {
+  pin_t b1 = {GPIOC, 13};                    /* board has its own pull-up, active low */
+  pin_mode(b1, 0);
+  RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+  SYSCFG->EXTICR[3] = (SYSCFG->EXTICR[3] & ~SYSCFG_EXTICR4_EXTI13) | SYSCFG_EXTICR4_EXTI13_PC;
+  EXTI->FTSR |= (1U << 13);                  /* falling edge = pressed */
+  EXTI->RTSR &= ~(1U << 13);
+  EXTI->PR    = (1U << 13);
+  EXTI->IMR  |= (1U << 13);
+  NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+static int uart_getc(void) {
+  if (rx_tail == rx_head) return -1;
+  int c = rx_buf[rx_tail];
+  rx_tail = (uint8_t)((rx_tail + 1) % RX_SIZE);
+  return c;
 }
 
 static uint16_t read_cm(int z) {
@@ -251,6 +323,8 @@ static char *put_u(char *b, uint32_t v, int width) {
   return b;
 }
 
+static char *put_u2(char *b, uint32_t v) { *b++ = (char)('0' + v / 10 % 10); *b++ = (char)('0' + v % 10); return b; }
+
 static void zone_line(char *b, char zone, uint16_t cm, bool occ, int mode) {
   *b++ = zone; *b++ = ':';
   if (cm == DIST_NO_ECHO) b = put_str(b, "NO ECHO ");
@@ -260,22 +334,20 @@ static void zone_line(char *b, char zone, uint16_t cm, bool occ, int mode) {
   *b = 0;
 }
 
-/* TIM3_CH2 on PC7 (zone A LED), TIM4_CH1 on PB6 (zone B LED). 1kHz PWM. */
-static void pwm_init_tim3_ch2(void) {
-  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
-  RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
-  pin_t p = {GPIOC, 7};
-  pin_af(p, 2); pin_mode(p, 2);
+/* TIM3_CH2 on PC7 (D9, zone A LED), TIM4_CH1 on PB6 (D10, zone B LED). 1kHz PWM. */
+static void pwm_init_leds(void) {
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
+  RCC->APB1ENR |= RCC_APB1ENR_TIM3EN | RCC_APB1ENR_TIM4EN;
+  pin_t a = {GPIOC, 7}, b = {GPIOB, 6};
+  pin_af(a, 2); pin_mode(a, 2);
+  pin_af(b, 2); pin_mode(b, 2);
+
   TIM3->PSC = 16 - 1;
   TIM3->ARR = 999;
   TIM3->CCMR1 = (TIM3->CCMR1 & ~TIM_CCMR1_OC2M) | (6U << 12) | TIM_CCMR1_OC2PE;
   TIM3->CCER |= TIM_CCER_CC2E;
   TIM3->CR1 |= TIM_CR1_ARPE | TIM_CR1_CEN;
-}
-static void pwm_init_tim4_ch1(void) {
-  RCC->APB1ENR |= RCC_APB1ENR_TIM4EN;
-  pin_t p = {GPIOB, 6};
-  pin_af(p, 2); pin_mode(p, 2);
+
   TIM4->PSC = 16 - 1;
   TIM4->ARR = 999;
   TIM4->CCMR1 = (TIM4->CCMR1 & ~TIM_CCMR1_OC1M) | (6U << 4) | TIM_CCMR1_OC1PE;
@@ -287,6 +359,177 @@ static inline void led_set(int z, uint16_t duty) {
 }
 
 static inline bool is_dark(void) { return pin_rd(LDR); }   /* HIGH = dark on this module */
+
+/* ===================================================================== */
+/* Pot: ADC1 channel 0 on PA0.                                           */
+/* ===================================================================== */
+#if USE_POT
+static void adc_init(void) {
+  RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+  pin_t a0 = {GPIOA, 0};
+  pin_mode(a0, 3);                                  /* analog */
+  ADC1->SMPR2 = (6U << 0);                          /* ch0: 144 cycles, fine for a 10k pot */
+  ADC1->SQR1 = 0;                                   /* 1 conversion per sequence */
+  ADC1->SQR3 = 0;                                   /* that conversion is channel 0 */
+  ADC1->CR2 = ADC_CR2_ADON;
+  delay_us(20);
+}
+static bool adc_read(uint16_t *out) {
+  uint32_t sum = 0;
+  for (int i = 0; i < POT_SAMPLES; i++) {
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+    uint32_t s = micros();
+    while (!(ADC1->SR & ADC_SR_EOC)) if (micros() - s > 200) return false;
+    sum += ADC1->DR;                                /* reading DR clears EOC */
+  }
+  *out = (uint16_t)(sum / POT_SAMPLES);
+  return true;
+}
+#endif
+
+/* ===================================================================== */
+/* RTC: on-chip, in the backup domain, keeps running through a reset.    */
+/* ===================================================================== */
+static bool rtc_lse;                                /* true = crystal, false = LSI fallback */
+static bool rtc_ok;
+
+static void rtc_unlock(void) { RTC->WPR = 0xCA; RTC->WPR = 0x53; }
+static void rtc_lock(void)   { RTC->WPR = 0xFF; }
+
+static bool rtc_wait_sync(void) {                   /* shadow registers caught up */
+  rtc_unlock();
+  RTC->ISR &= ~RTC_ISR_RSF;
+  rtc_lock();
+  uint32_t s = micros();
+  while (!(RTC->ISR & RTC_ISR_RSF)) if (micros() - s > 50000) return false;
+  return true;
+}
+
+static bool rtc_write(const dt_t *t) {
+  if (!dt_valid(t)) return false;
+  rtc_unlock();
+  RTC->ISR |= RTC_ISR_INIT;
+  uint32_t s = micros();
+  while (!(RTC->ISR & RTC_ISR_INITF))
+    if (micros() - s > 50000) { rtc_lock(); return false; }
+  /* 32768 Hz / 128 / 256 = 1 Hz. LSI is ~32 kHz: / 128 / 250. Two writes, S then A. */
+  RTC->PRER = rtc_lse ? 255U : 249U;
+  RTC->PRER |= (127U << 16);
+  RTC->TR = ((uint32_t)bcd(t->h) << 16) | ((uint32_t)bcd(t->m) << 8) | bcd(t->s);
+  RTC->DR = ((uint32_t)bcd(t->y) << 16) | ((uint32_t)weekday(t->d, t->mo, 2000 + t->y) << 13) |
+            ((uint32_t)bcd(t->mo) << 8) | bcd(t->d);
+  RTC->CR &= ~RTC_CR_FMT;                           /* 24 hour */
+  RTC->ISR &= ~RTC_ISR_INIT;
+  rtc_lock();
+  return rtc_wait_sync();
+}
+
+static void rtc_read(dt_t *t) {
+  uint32_t tr = RTC->TR;                            /* reading TR freezes DR until DR is read */
+  uint32_t dr = RTC->DR;
+  t->h  = unbcd((uint8_t)((tr >> 16) & 0x3F));
+  t->m  = unbcd((uint8_t)((tr >> 8) & 0x7F));
+  t->s  = unbcd((uint8_t)(tr & 0x7F));
+  t->y  = unbcd((uint8_t)((dr >> 16) & 0xFF));
+  t->mo = unbcd((uint8_t)((dr >> 8) & 0x1F));
+  t->d  = unbcd((uint8_t)(dr & 0x3F));
+}
+
+/* BKP0R holds a fingerprint of the build that last set the clock. Same build
+ * (plain reset) = leave the running clock alone. New build or empty backup
+ * domain (power was off) = start again from this build's compile time. */
+static bool rtc_init(void) {
+  const uint32_t magic = fnv1a(__DATE__, __TIME__);
+  RCC->APB1ENR |= RCC_APB1ENR_PWREN;
+  PWR->CR |= PWR_CR_DBP;                            /* allow writes to the backup domain */
+
+  if ((RCC->BDCR & RCC_BDCR_RTCEN) && RTC->BKP0R == magic) {
+    rtc_lse = (RCC->BDCR & RCC_BDCR_RTCSEL) == RCC_BDCR_RTCSEL_0;
+    if (!rtc_lse) {                                 /* LSI is switched off by every reset */
+      RCC->CSR |= RCC_CSR_LSION;
+      uint32_t s = micros();
+      while (!(RCC->CSR & RCC_CSR_LSIRDY)) if (micros() - s > 10000) return false;
+    }
+    return rtc_wait_sync();
+  }
+
+  RCC->BDCR |= RCC_BDCR_BDRST;                      /* clean slate: only way to change RTCSEL */
+  RCC->BDCR &= ~RCC_BDCR_BDRST;
+  RCC->BDCR |= RCC_BDCR_LSEON;
+  uint32_t s = micros();
+  rtc_lse = true;
+  while (!(RCC->BDCR & RCC_BDCR_LSERDY))
+    if (micros() - s > 2500000) { rtc_lse = false; break; }   /* crystal can take ~2 s */
+
+  if (rtc_lse) {
+    RCC->BDCR |= RCC_BDCR_RTCSEL_0;                 /* 01 = LSE */
+  } else {
+    RCC->BDCR &= ~RCC_BDCR_LSEON;
+    RCC->CSR |= RCC_CSR_LSION;
+    s = micros();
+    while (!(RCC->CSR & RCC_CSR_LSIRDY)) if (micros() - s > 10000) return false;
+    RCC->BDCR |= RCC_BDCR_RTCSEL_1;                 /* 10 = LSI */
+  }
+  RCC->BDCR |= RCC_BDCR_RTCEN;
+
+  dt_t t;
+  if (!parse_build(__DATE__, __TIME__, &t) || !rtc_write(&t)) return false;
+  RTC->BKP0R = magic;
+  return true;
+}
+
+static void uart_put2(uint8_t v) { uart_putc((char)('0' + v / 10)); uart_putc((char)('0' + v % 10)); }
+static void uart_time(void) {
+  if (!rtc_ok) return;
+  dt_t t; rtc_read(&t);
+  uart_putc('['); uart_put2(t.h); uart_putc(':'); uart_put2(t.m); uart_putc(':'); uart_put2(t.s);
+  uart_puts("] ");
+}
+static void uart_datetime(void) {
+  if (!rtc_ok) { uart_puts("RTC not running\r\n"); return; }
+  dt_t t; rtc_read(&t);
+  uart_put2(t.d); uart_putc('/'); uart_put2(t.mo); uart_puts("/20"); uart_put2(t.y); uart_putc(' ');
+  uart_put2(t.h); uart_putc(':'); uart_put2(t.m); uart_putc(':'); uart_put2(t.s);
+  uart_puts(rtc_lse ? "  (crystal)\r\n" : "  (LSI fallback: drifts minutes per day)\r\n");
+}
+
+/* Serial commands, typed into PuTTY / Tera Term / Arduino serial monitor:
+ *   T 08:30:00   set time       D 18/10/26   set date       ?   show both */
+static void handle_command(char *cmd) {
+  while (*cmd == ' ') cmd++;
+  char op = *cmd;
+  if (op >= 'a' && op <= 'z') op = (char)(op - 32);
+  char *arg = cmd + 1;
+  while (*arg == ' ') arg++;
+  dt_t t;
+  if (op == 'T' || op == 'D') {
+    if (!rtc_ok) { uart_puts("RTC not running\r\n"); return; }
+    rtc_read(&t);
+    bool good = (op == 'T') ? parse_hms(arg, &t) : parse_dmy(arg, &t);
+    if (good && rtc_write(&t)) { uart_puts("OK, now "); uart_datetime(); }
+    else uart_puts(op == 'T' ? "Bad time. Use: T HH:MM or T HH:MM:SS\r\n"
+                             : "Bad date. Use: D DD/MM/YY\r\n");
+  } else if (op == '?' || op == 0) {
+    uart_datetime();
+  } else {
+    uart_puts("Commands: T 08:30:00 | D 18/10/26 | ?\r\n");
+  }
+}
+
+static void serial_service(void) {
+  static char cmd[24];
+  static uint8_t n;
+  int c;
+  while ((c = uart_getc()) >= 0) {
+    if (c == '\r' || c == '\n') {
+      if (n) { uart_puts("\r\n"); cmd[n] = 0; handle_command(cmd); n = 0; }
+    } else if ((c == 8 || c == 127) && n) {
+      n--; uart_puts("\b \b");
+    } else if (c >= ' ' && n < sizeof(cmd) - 1) {
+      cmd[n++] = (char)c; uart_putc((char)c);       /* echo, terminals don't by default */
+    }
+  }
+}
 
 
 /* ===================================================================== */
@@ -455,7 +698,7 @@ static void rfid_service(void) {
     return;
   }
   rf.last_uid = uid;
-  uart_puts("RFID "); uart_puthex32(uid); uart_puts(" ");
+  uart_time(); uart_puts("RFID "); uart_puthex32(uid); uart_puts(" ");
   if (!uid_allowed(ALLOWED_UIDS, uid)) {
     rf.last_txt = "DENY";
     uart_puts("DENIED\r\n");
@@ -485,7 +728,7 @@ static void rfid_service(void) {
 /* delay_ms that keeps listening for cards while it waits */
 static void wait_poll(uint32_t ms) {
   uint32_t s = micros(), us = ms * 1000UL;
-  while (micros() - s < us) { rfid_service(); delay_ms(2); }
+  while (micros() - s < us) { rfid_service(); serial_service(); delay_ms(2); }
 }
 
 static void setup(void) {
@@ -506,12 +749,21 @@ static void setup(void) {
   pin_mode(LED, 1);
   pin_mode(LDR, 0); pin_pull(LDR, 1);   /* pull-up, same reasoning as the arduino build */
 
-  pwm_init_tim3_ch2();
-  pwm_init_tim4_ch1();
+  pwm_init_leds();
   led_set(0, 0); led_set(1, 0);
 
   uart_init();
   uart_puts("\r\nSmart Classroom - Nucleo-F401RE\r\n");
+
+  rtc_ok = rtc_init();
+  uart_puts("RTC: "); uart_datetime();
+  if (rtc_ok && !rtc_lse) uart_puts("RTC: no 32.768 kHz crystal answered, using LSI\r\n");
+#if USE_POT
+  adc_init();
+#endif
+  uart_rx_init();
+  button_init();
+  uart_puts("Commands: T 08:30:00 | D 18/10/26 | ?\r\n");
 
   i2c_init();
   delay_ms(100);
@@ -552,6 +804,10 @@ int main(void) {
   bool stale_timing = false;
   uint32_t stale_since = 0;
   char line[24];
+  ovr_t ovr = OVR_AUTO;
+  uint32_t btn_seen = btn_presses;
+  uint16_t bright = BRIGHT_MAX;
+  static const char *OVR_TXT[3] = { "AUTO", "ON", "OFF" };
 
   for (;;) {
     for (int z = 0; z < 2; z++) { cm[z] = read_cm(z); wait_poll(PING_GAP_MS); }
@@ -563,6 +819,18 @@ int main(void) {
         for (uint8_t p = 0; p < 8; p++) oled_line(p, "");
       rf.ok = rf.ok ? rc_present() : rc522_init();   /* notice a reader that was unplugged or plugged in */
     }
+
+    serial_service();
+
+    uint32_t presses = btn_presses;                 /* one read: the ISR may bump it any time */
+    if (presses != btn_seen) {
+      ovr = (ovr_t)((ovr + (presses - btn_seen)) % 3);
+      btn_seen = presses;
+      uart_time(); uart_puts("Button: override "); uart_puts(OVR_TXT[ovr]); uart_puts("\r\n");
+    }
+#if USE_POT
+    { uint16_t v; if (adc_read(&v)) bright = pot_brightness(v, bright); }
+#endif
 
     bool dark = is_dark();
     bool boost = rf_boost();
@@ -583,14 +851,7 @@ int main(void) {
       bool occ_eff = occ[z] || boost;               /* a recent tap-in counts as "someone is here" */
 
 
-      uint16_t duty;
-      switch (mode[z]) {
-        case 0:  duty = LED_OFF; break;
-        case 1:  duty = (occ_eff && dark) ? LED_FULL : LED_OFF; break;
-        case 2:  duty = LED_DIM; break;
-        default: duty = LED_FULL; break;
-      }
-      led_set(z, duty);
+      led_set(z, led_duty(ovr, mode[z], occ_eff, dark, bright, LED_DIM));
     }
 
     /* Everyone tapped in but the room has been empty for ages: they left without tapping out. */
@@ -626,13 +887,30 @@ int main(void) {
     }
     oled_line(5, line);
     rfid_service();
-    { char *b = put_str(line, "Occupied: "); b = put_u(b, occ_n, 1); b = put_str(b, "/2"); *b = 0; }
+    if (rtc_ok) {
+      dt_t t; rtc_read(&t);
+      char *b = put_u2(line, t.d); *b++ = '/'; b = put_u2(b, t.mo); *b++ = ' ';
+      b = put_u2(b, t.h); *b++ = ':'; b = put_u2(b, t.m); *b++ = ':'; b = put_u2(b, t.s);
+      b = put_str(b, rtc_lse ? "" : " LSI"); *b = 0;
+    } else {
+      put_str(line, "RTC ERROR")[0] = 0;
+    }
+    oled_line(4, line);
+    {
+      char *b = put_str(line, "OCC "); b = put_u(b, occ_n, 1); b = put_str(b, "/2 ");
+      b = put_str(b, OVR_TXT[ovr]); *b++ = ' ';
+      b = put_u(b, (uint32_t)bright * 100 / BRIGHT_MAX, 3); *b++ = '%'; *b = 0;
+    }
     oled_line(6, line);
     if (rf.ok) { char *b = put_str(line, "RFID OK V"); b = put_hex8(b, rc_version()); *b = 0; }
     else put_str(line, "RFID NOT FOUND")[0] = 0;
     oled_line(7, line);
     rfid_service();
 
+    serial_service();
+    if (rx_any && micros() - rx_last_us < RX_QUIET_US) goto heartbeat;   /* you are typing: keep the terminal clean */
+
+    uart_time();
     const char *zn = "AB";
     for (int z = 0; z < 2; z++) {
       uart_putc(zn[z]); uart_putc('=');
@@ -647,8 +925,11 @@ int main(void) {
     else uart_puts("DHT=ERR");
     uart_puts("  IN="); uart_putu((uint32_t)rf_count()); uart_puts(boost ? "(boost)" : "");
     uart_puts(rf.ok ? "  RFID=ok" : "  RFID=none");
+    uart_puts("  OVR="); uart_puts(OVR_TXT[ovr]);
+    uart_puts(" BRT="); uart_putu((uint32_t)bright * 100 / BRIGHT_MAX); uart_putc('%');
     uart_puts(oled_addr ? "  OLED=ok\r\n" : "  OLED=none\r\n");
 
+heartbeat:
     LED.port->ODR ^= (1U << LED.pin);
   }
 }

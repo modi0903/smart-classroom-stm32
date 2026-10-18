@@ -1,9 +1,10 @@
 # Smart Classroom: Nucleo-F401RE
 
-2x HC-SR04 zones, DHT11, 2x LED, LM393 LDR, SH1106 OLED, **RC522 RFID at the
-door**.
+2x HC-SR04 zones, DHT11, 2x LED, LM393 LDR, SH1106 OLED, RC522 RFID at the
+door, **one dimmer pot, on-chip RTC clock, manual override button**.
 
-Bare-metal CMSIS, no HAL. HSI 16 MHz, no PLL, no interrupts.
+Bare-metal CMSIS, no HAL. HSI 16 MHz, no PLL. Two interrupts (button EXTI,
+USART2 RX); everything else is polled.
 
 Two zones instead of three: less wiring and lower cost per classroom.
 
@@ -25,22 +26,59 @@ on the ST morpho headers; find them in the pin table of ST's UM1724.
 | **RC522 RFID** | SCK / MISO / MOSI | PB13 / PB14 / PB15 (SPI2) |
 | | SDA (=SS) / RST | PB12 / PC5 |
 | | 3.3V / GND | **3V3 only, never 5V** / GND (IRQ unused) |
+| **Pot (10k)** | wiper (middle) / ends | **A0 (PA0)** / 3V3 and GND |
+| Override button | | B1, the blue button on the board (PC13). Nothing to wire |
+| RTC | | inside the STM32. Nothing to wire |
 
 All grounds common.
 ECHO pins are 5V tolerant, no divider needed.
 LDR: DO reads HIGH when dark on our module. If a replacement module reads
 the other way, change `is_dark()` in `main.c`.
 
-## LED modes
+## LED modes, pot and button
 
 Set `ZONE_A_MODE` / `ZONE_B_MODE` at the top of `main.c` and reflash.
 
 | Value | Mode | LED |
 |---|---|---|
 | 0 | OFF | always off |
-| 1 | AUTO | full on only if zone occupied (or entry boost) **and** dark |
-| 2 | DIM | ~10% always |
-| 3 | MAX | full on always |
+| 1 | AUTO | on only if zone occupied (or entry boost) **and** dark |
+| 2 | DIM | ~10% always (never brighter than the pot) |
+| 3 | MAX | on always |
+
+**Pot** = how bright "on" is, for both zones, 5% to 100%. It never goes to 0;
+switching off is the button's or the mode's job. Pot not wired yet? Set
+`USE_POT 0` or A0 floats and the brightness wanders.
+
+**Blue button (B1)** cycles a manual override for both LEDs, on an
+interrupt: `AUTO` (modes above) -> `ON` (pot brightness, ignores sensors) ->
+`OFF` -> `AUTO`. It doesn't survive a reset.
+
+## Clock (RTC)
+
+The STM32's own RTC, clocked from the Nucleo's 32.768 kHz crystal (X2).
+
+- On flashing, the clock starts from the **time you compiled**, so it is
+  about 30 s behind. Set it exactly over serial (below).
+- A plain reset (black button) keeps the time.
+- **Unplugging USB loses the time.** The Nucleo ties the RTC's battery pin
+  to the main 3.3 V, so there is no backup. After power-up it restarts from
+  the compile time; set it again. A DS3231 module would fix this if needed.
+- If the board has no crystal fitted (very old Nucleo revisions), it falls
+  back to the internal LSI oscillator. The OLED clock line shows `LSI`.
+  LSI is only good to a few minutes per day.
+
+Set it from any serial terminal (PuTTY, Tera Term, Arduino serial monitor)
+on the ST-LINK COM port, 115200, line ending CR or LF:
+
+```
+T 08:30:00      set time (T 08:30 also works)
+D 18/10/26      set date (D 18/10/2026 also works)
+?               print date and time
+```
+
+What you type is echoed, and the status line pauses for 5 s while you type.
+Received characters arrive through the USART2 RX interrupt.
 
 ## Door RFID
 
@@ -110,17 +148,18 @@ LIGHT: DARK
 IN:2 3A4B5C6D IN
 A: 45cm OCC AUT
 B:FAR     AUT
-
+18/10 08:30:12
 T:30C   H:65%
-Occupied: 1/2
+OCC 1/2 AUTO  75%
 RFID OK V92
 ```
 
 ## Debugging
 
 - UART2 via the ST-LINK virtual COM port, 115200:
-  `A=45(OCC) AUT  B=FAR      AUT  LDR=DARK  T=30 H=65  IN=2(boost)  RFID=ok  OLED=ok`
-  Card taps print their own line: `RFID 3A4B5C6D IN inside=2`.
+  `[08:30:12] A=45(OCC) AUT  B=FAR      AUT  LDR=DARK  T=30 H=65  IN=2(boost)  RFID=ok  OVR=AUTO BRT=75%  OLED=ok`
+  Card taps and button presses print their own timestamped lines:
+  `[08:30:14] RFID 3A4B5C6D IN inside=2`, `[08:31:02] Button: override ON`.
 - LD2 toggles every loop = firmware alive.
 - `NO ECHO`: sensor never answered, check its TRIG/ECHO/5V wiring.
 - `FAR`: sensor works, nothing within ~4 m.
@@ -130,3 +169,8 @@ RFID OK V92
   0xFF. Check 3V3, GND and the four SPI wires (MISO and MOSI swapped is the
   usual mistake). Retries every 2 s. A working chip reports version 0x91 or
   0x92; some clones report others and are fine.
+- `RTC ERROR`: the RTC failed to start. Should not happen; reset the board.
+- Button does nothing: check the UART for `Button:` lines. If they appear,
+  the override is working and the mode logic is what you are seeing.
+- Brightness jumps around: pot wiper not on A0, or an end of the pot not on
+  3V3/GND.
