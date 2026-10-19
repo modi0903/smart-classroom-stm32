@@ -1,7 +1,9 @@
 # Smart Classroom: Nucleo-F401RE
 
 2x HC-SR04 zones, DHT11, 2x LED, LM393 LDR, SH1106 OLED, RC522 RFID at the
-door, **one dimmer pot, on-chip RTC clock, manual override button**.
+door, light dimmer pot, on-chip RTC clock, manual override button, **one fan
+motor (IRLZ44N, 9 V battery) with its own speed pot, running only while
+someone is tapped in on the RFID**.
 
 Bare-metal CMSIS, no HAL. HSI 16 MHz, no PLL. Two interrupts (button EXTI,
 USART2 RX); everything else is polled.
@@ -26,8 +28,10 @@ on the ST morpho headers; find them in the pin table of ST's UM1724.
 | **RC522 RFID** | SCK / MISO / MOSI | PB13 / PB14 / PB15 (SPI2) |
 | | SDA (=SS) / RST | PB12 / PC5 |
 | | 3.3V / GND | **3V3 only, never 5V** / GND (IRQ unused) |
-| **Pot (10k)** | wiper (middle) / ends | **A0 (PA0)** / 3V3 and GND |
+| **Light pot (10k)** | wiper (middle) / ends | **A0 (PA0)** / 3V3 and GND |
 | Override button | | B1, the blue button on the board (PC13). Nothing to wire |
+| **Fan speed pot (10k)** | wiper (middle) / ends | **A2 (PA4)** / 3V3 and GND |
+| **Fan gate** | via 220 ohm, 10k gate to GND | **D7 (PA8)**, TIM1_CH1 |
 | RTC | | inside the STM32. Nothing to wire |
 
 All grounds common.
@@ -53,6 +57,50 @@ switching off is the button's or the mode's job. Pot not wired yet? Set
 **Blue button (B1)** cycles a manual override for both LEDs, on an
 interrupt: `AUTO` (modes above) -> `ON` (pot brightness, ignores sensors) ->
 `OFF` -> `AUTO`. It doesn't survive a reset.
+
+## Fan (motor)
+
+One IRLZ44N stage per motor:
+
+```
+   9V (+) ───────────┬──────────────┐
+                     │              │
+                   MOTOR         1N4007   (stripe end to 9V +)
+                     ├──────────────┘
+                   DRAIN
+   D7 ──[220]──┬── GATE    IRLZ44N   (writing facing you, legs down: G D S)
+             [10k] SOURCE
+               │     │
+   Nucleo GND ─┴─────┴────── 9V (-)
+```
+
+- **9V (-) must join Nucleo GND.** 9V (+) goes nowhere near the Nucleo.
+- The diode is required: without it the motor's turn-off spike kills the
+  MOSFET or resets the board.
+- The 10k keeps the motor off while the board boots or is being flashed.
+- Keep motor wires away from the OLED's SCL/SDA.
+- Test by hand first: gate wire to 3V3, motor spins; to GND, it stops.
+
+Behaviour (same override button as the lights):
+
+| | Fan |
+|---|---|
+| Override OFF | off |
+| Override ON | runs at the knob's speed, even with nobody tapped in |
+| AUTO, nobody tapped in on the RFID | off |
+| AUTO, at least one card inside | runs at the knob's speed |
+| Knob turned fully down (bottom ~5 %) | off |
+
+The fan pot on **A2** sets speed from 35 % (slowest that reliably spins a
+hobby motor) to 100 %. "100 %" is capped at `FAN_MAX_PCT` (60) of the
+battery: about 5.4 V average, right for 3-6 V motors. Set it to 100 for 9 V
+motors. Every start from stopped gets 0.3 s at full allowed speed so the
+motor breaks free. PWM is 20 kHz, so no whine.
+
+"Inside" is the RFID headcount, so the fan stops when the last card taps
+out, or when the roster self-clears after both zones have been empty for
+2 minutes (people who forgot to tap out). No fan pot wired yet? Set
+`USE_FAN_POT 0` and it runs at full allowed speed when on.
 
 ## Clock (RTC)
 
@@ -150,14 +198,14 @@ A: 45cm OCC AUT
 B:FAR     AUT
 18/10 08:30:12
 T:30C   H:65%
-OCC 1/2 AUTO  75%
+OCC1/2 AUTO L75 F60
 RFID OK V92
 ```
 
 ## Debugging
 
 - UART2 via the ST-LINK virtual COM port, 115200:
-  `[08:30:12] A=45(OCC) AUT  B=FAR      AUT  LDR=DARK  T=30 H=65  IN=2(boost)  RFID=ok  OVR=AUTO BRT=75%  OLED=ok`
+  `[08:30:12] A=45(OCC) AUT  B=FAR      AUT  LDR=DARK  T=30 H=65  IN=2(boost)  RFID=ok  OVR=AUTO BRT=75% FAN=60%  OLED=ok`
   Card taps and button presses print their own timestamped lines:
   `[08:30:14] RFID 3A4B5C6D IN inside=2`, `[08:31:02] Button: override ON`.
 - LD2 toggles every loop = firmware alive.

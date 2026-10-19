@@ -105,6 +105,58 @@ static inline uint16_t led_duty(ovr_t ovr, int mode, bool occupied, bool dark,
   }
 }
 
+/* ----------------------------------------------------------------- fan --
+ * One fan for the room. The knob (fan pot) sets the speed; RFID decides
+ * whether anyone is inside. Bottom of the knob's travel = off, after that
+ * FAN_MIN_PCT..100 % (a hobby motor stalls below about a third).
+ * Knob changes under FAN_KNOB_STEP are ignored so ADC noise doesn't hunt.
+ */
+#define FAN_MIN_PCT    35
+#define FAN_KNOB_OFF   200      /* ADC counts: below this the knob means "off" */
+#define FAN_KNOB_STEP  3
+
+static inline uint8_t fan_knob(uint16_t adc, uint8_t cur) {
+  if (adc > 4095) adc = 4095;
+  if (adc < FAN_KNOB_OFF) return 0;
+  int target = FAN_MIN_PCT + (int)(adc - FAN_KNOB_OFF) * (100 - FAN_MIN_PCT) / (4095 - FAN_KNOB_OFF);
+  int d = target - (int)cur;
+  if (d < 0) d = -d;
+  if (cur != 0 && d < FAN_KNOB_STEP && target != FAN_MIN_PCT && target != 100) return cur;
+  return (uint8_t)target;
+}
+
+/* Button override first (ON runs it even with nobody inside, OFF stops it),
+ * otherwise: someone tapped in -> knob speed, nobody inside -> off. */
+static inline uint8_t fan_cmd(ovr_t ovr, bool someone_inside, uint8_t knob) {
+  if (ovr == OVR_OFF) return 0;
+  if (ovr == OVR_ON)  return knob;
+  return someone_inside ? knob : 0;
+}
+
+/* A stopped motor will not start on 35 %. When the command goes from 0 to
+ * something, give it full allowed speed for FAN_KICK_US first. */
+#define FAN_KICK_US 300000UL
+
+typedef struct { uint8_t prev; bool kicking; uint32_t t0; } fan_t;
+
+static inline uint8_t fan_apply(fan_t *f, uint8_t pct, uint32_t now_us) {
+  if (pct == 0) { f->prev = 0; f->kicking = false; return 0; }
+  if (f->prev == 0) { f->kicking = true; f->t0 = now_us; }
+  f->prev = pct;
+  if (f->kicking) {
+    if (now_us - f->t0 < FAN_KICK_US) return 100;
+    f->kicking = false;
+  }
+  return pct;
+}
+
+/* Percent -> timer compare value. max_pct caps the average motor voltage:
+ * 9 V battery x 60 % ~ 5.4 V for 3-6 V hobby motors. ARR 799: 800 = always on. */
+static inline uint16_t fan_ccr(uint8_t pct, uint8_t max_pct) {
+  if (pct > 100) pct = 100;
+  return (uint16_t)((uint32_t)pct * max_pct * 8 / 100);
+}
+
 /* ----------------------------------------------------------- date/time --
  */
 typedef struct { uint8_t h, m, s, d, mo, y; } dt_t;   /* y = years since 2000 */

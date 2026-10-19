@@ -126,8 +126,45 @@ static void test_datetime(void) {
   CHECK(fnv1a("", "") != 0);
 }
 
+static void test_fan(void) {
+  CHECK(fan_knob(0, 50) == 0);                                /* knob at the bottom = off */
+  CHECK(fan_knob(FAN_KNOB_OFF - 1, 50) == 0);
+  CHECK(fan_knob(FAN_KNOB_OFF, 0) == FAN_MIN_PCT);            /* first click on = minimum that spins */
+  CHECK(fan_knob(4095, 50) == 100);
+  uint8_t k = fan_knob(2048, 0);
+  CHECK(k > FAN_MIN_PCT && k < 100);
+  CHECK(fan_knob(2060, k) == k);                              /* noise ignored */
+  CHECK(fan_knob(2600, k) > k);                               /* real turn followed */
+  uint8_t prev = 0; int up = 1;                               /* sweep never goes backwards */
+  for (int a = 0; a <= 4095; a += 32) { uint8_t n = fan_knob((uint16_t)a, prev); if (n < prev) up = 0; prev = n; }
+  CHECK(up);
+
+  CHECK(fan_cmd(OVR_AUTO, false, 80) == 0);                   /* nobody tapped in */
+  CHECK(fan_cmd(OVR_AUTO, true, 80) == 80);                   /* someone inside: knob speed */
+  CHECK(fan_cmd(OVR_AUTO, true, 0) == 0);                     /* knob off wins */
+  CHECK(fan_cmd(OVR_ON, false, 60) == 60);                    /* override ON: knob speed, nobody needed */
+  CHECK(fan_cmd(OVR_OFF, true, 100) == 0);
+
+  fan_t f = {0, false, 0};
+  CHECK(fan_apply(&f, 40, 1000) == 100);                      /* kick */
+  CHECK(fan_apply(&f, 40, 1000 + FAN_KICK_US) == 40);
+  CHECK(fan_apply(&f, 60, 9000000) == 60);                    /* no re-kick while running */
+  CHECK(fan_apply(&f, 0, 9100000) == 0);
+  CHECK(fan_apply(&f, 40, 9200000) == 100);                   /* re-kick after stop */
+  fan_t g = {0, false, 0}; uint32_t t0 = 0xFFFFFFFFUL - 100000UL;
+  CHECK(fan_apply(&g, 50, t0) == 100);
+  CHECK(fan_apply(&g, 50, t0 + 250000UL) == 100);             /* timer wrapped, still kicking */
+  CHECK(fan_apply(&g, 50, t0 + 350000UL) == 50);
+
+  CHECK(fan_ccr(0, 60) == 0);
+  CHECK(fan_ccr(100, 60) == 480);                             /* 60 % of 800 */
+  CHECK(fan_ccr(100, 100) == 800);                            /* = ARR+1: fully on */
+  CHECK(fan_ccr(200, 100) == 800);                            /* clamp */
+  CHECK(fan_ccr(35, 60) == 168);
+}
+
 int main(void) {
-  test_pot(); test_led_duty(); test_datetime();
+  test_pot(); test_led_duty(); test_datetime(); test_fan();
   test_roster(); test_roster_full(); test_roster_wrap(); test_allowed();
   printf("%d checks, %d failed\n", checks, fails);
   return fails ? 1 : 0;

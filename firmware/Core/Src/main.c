@@ -2,7 +2,8 @@
  * Smart Classroom, Nucleo-F401RE, bare metal CMSIS, no HAL.
  * 2 zones: HC-SR04 occupancy + class-light LED each, shared DHT11 + OLED,
  * LM393 module for the AUTO mode's darkness check, RC522 RFID reader at the
- * door, one pot dimming both LEDs, on-chip RTC for the clock.
+ * door, one pot dimming both LEDs, on-chip RTC for the clock, one fan motor
+ * per zone.
  *
  * Zone A  TRIG PA10 (D2)   ECHO PB3 (D3)   LED PC7 (D9)   TIM3_CH2
  * Zone B  TRIG PB5  (D4)   ECHO PB4 (D5)   LED PB6 (D10)  TIM4_CH1
@@ -10,12 +11,17 @@
  * OLED    SCL PB8 (D15)  SDA PB9 (D14), I2C1
  * LDR     PB0 (A3), LM393 DO pin, HIGH = dark on this module
  * RC522   SPI2: SCK PB13  MISO PB14  MOSI PB15  SDA(SS) PB12  RST PC5   3V3 ONLY
- * POT     wiper on PA0 (A0), ends on 3V3 and GND, ADC1 channel 0
+ * POT     light: wiper on PA0 (A0), ADC1 ch0.  fan: wiper on PA4 (A2), ADC1 ch4.
+ *         Pot ends on 3V3 and GND.
+ * FAN     PA8 (D7)  TIM1_CH1 -> 220R -> IRLZ44N gate (10k gate-GND), 20 kHz PWM.
+ *         Motor on the 9 V battery, 1N4007 across it, battery (-) to Nucleo GND.
  * BUTTON  B1 (blue, on the board), PC13, EXTI line 13 interrupt
  * HC-SR04 on 5V, everything else 3V3, grounds common.
  *
  * Each zone's mode (OFF/AUTO/DIM/MAX) is a #define below; the pot sets how
- * bright "on" is, the blue button cycles a manual override AUTO -> ON -> OFF.
+ * bright "on" is, the blue button cycles a manual override AUTO -> ON -> OFF
+ * for lights and fan together. The fan runs while RFID says someone is
+ * inside, at the speed set by the fan pot, capped at FAN_MAX_PCT of the battery.
  * Occupancy is debounced: needs OCC_MS of continuous detection to go
  * occupied, VACANT_MS of continuous clear to go back to empty. Tapping a card
  * at the door toggles that card in/out of the headcount; a tap-in also makes
@@ -37,8 +43,12 @@
 
 #define ZONE_A_MODE 1   /* 0 off, 1 auto, 2 dim, 3 max */
 #define ZONE_B_MODE 1
+#define FAN_MAX_PCT 60  /* 9 V battery x 60 % = ~5.4 V average for 3-6 V motors. 100 for 9 V motors */
 #ifndef USE_POT
 #define USE_POT     1   /* 0 until the pot is wired, or A0 floats and brightness wanders */
+#endif
+#ifndef USE_FAN_POT
+#define USE_FAN_POT 1   /* fan speed knob on A2. 0 = fan runs at full allowed speed when on */
 #endif
 
 #define OCC_CM      100
@@ -361,20 +371,39 @@ static inline void led_set(int z, uint16_t duty) {
 static inline bool is_dark(void) { return pin_rd(LDR); }   /* HIGH = dark on this module */
 
 /* ===================================================================== */
+/* Fan: TIM1_CH1 on PA8 (D7). 16 MHz / 800 = 20 kHz, above hearing, so  */
+/* the motor doesn't whine. CCR 800 = 100 %.                             */
+/* ===================================================================== */
+static void fan_init(void) {
+  RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
+  pin_t a = {GPIOA, 8};
+  pin_af(a, 1); pin_mode(a, 2);                     /* AF1 = TIM1 */
+  TIM1->PSC = 0;
+  TIM1->ARR = 799;
+  TIM1->CCMR1 = (TIM1->CCMR1 & ~TIM_CCMR1_OC1M) | (6U << 4) | TIM_CCMR1_OC1PE;
+  TIM1->CCR1 = 0;
+  TIM1->CCER |= TIM_CCER_CC1E;
+  TIM1->BDTR |= TIM_BDTR_MOE;                       /* advanced timer: no output without MOE */
+  TIM1->EGR = TIM_EGR_UG;
+  TIM1->CR1 |= TIM_CR1_ARPE | TIM_CR1_CEN;
+}
+static inline void fan_set(uint8_t pct) { TIM1->CCR1 = fan_ccr(pct, FAN_MAX_PCT); }
+
+/* ===================================================================== */
 /* Pot: ADC1 channel 0 on PA0.                                           */
 /* ===================================================================== */
-#if USE_POT
+#if USE_POT || USE_FAN_POT
 static void adc_init(void) {
   RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
-  pin_t a0 = {GPIOA, 0};
-  pin_mode(a0, 3);                                  /* analog */
-  ADC1->SMPR2 = (6U << 0);                          /* ch0: 144 cycles, fine for a 10k pot */
+  pin_t a0 = {GPIOA, 0}, a2 = {GPIOA, 4};
+  pin_mode(a0, 3); pin_mode(a2, 3);                 /* analog */
+  ADC1->SMPR2 = (6U << 0) | (6U << 12);             /* ch0, ch4: 144 cycles, fine for 10k pots */
   ADC1->SQR1 = 0;                                   /* 1 conversion per sequence */
-  ADC1->SQR3 = 0;                                   /* that conversion is channel 0 */
   ADC1->CR2 = ADC_CR2_ADON;
   delay_us(20);
 }
-static bool adc_read(uint16_t *out) {
+static bool adc_read(uint8_t ch, uint16_t *out) {
+  ADC1->SQR3 = ch;                                  /* the one conversion is this channel */
   uint32_t sum = 0;
   for (int i = 0; i < POT_SAMPLES; i++) {
     ADC1->CR2 |= ADC_CR2_SWSTART;
@@ -751,6 +780,7 @@ static void setup(void) {
 
   pwm_init_leds();
   led_set(0, 0); led_set(1, 0);
+  fan_init();                                       /* motors off from the first instant */
 
   uart_init();
   uart_puts("\r\nSmart Classroom - Nucleo-F401RE\r\n");
@@ -758,7 +788,7 @@ static void setup(void) {
   rtc_ok = rtc_init();
   uart_puts("RTC: "); uart_datetime();
   if (rtc_ok && !rtc_lse) uart_puts("RTC: no 32.768 kHz crystal answered, using LSI\r\n");
-#if USE_POT
+#if USE_POT || USE_FAN_POT
   adc_init();
 #endif
   uart_rx_init();
@@ -797,6 +827,9 @@ int main(void) {
 
   uint8_t temp = 0, hum = 0;
   bool dht_ok = false;
+  fan_t fan = {0, false, 0};
+  uint8_t fan_now = 0;
+  uint8_t knob = 100;                               /* fan speed from the A2 pot; 100 if no pot */
   uint32_t last_dht = micros() - DHT_PERIOD_US;
   uint16_t cm[2];
   bool occ[2] = {false, false};
@@ -829,7 +862,10 @@ int main(void) {
       uart_time(); uart_puts("Button: override "); uart_puts(OVR_TXT[ovr]); uart_puts("\r\n");
     }
 #if USE_POT
-    { uint16_t v; if (adc_read(&v)) bright = pot_brightness(v, bright); }
+    { uint16_t v; if (adc_read(0, &v)) bright = pot_brightness(v, bright); }
+#endif
+#if USE_FAN_POT
+    { uint16_t v; if (adc_read(4, &v)) knob = fan_knob(v, knob); }
 #endif
 
     bool dark = is_dark();
@@ -853,6 +889,10 @@ int main(void) {
 
       led_set(z, led_duty(ovr, mode[z], occ_eff, dark, bright, LED_DIM));
     }
+
+    /* Fan: on while at least one card is tapped in, speed from the knob. */
+    fan_now = fan_cmd(ovr, rf_count() > 0, knob);
+    fan_set(fan_apply(&fan, fan_now, micros()));
 
     /* Everyone tapped in but the room has been empty for ages: they left without tapping out. */
     if (rf_count() > 0 && occ_n == 0 && !boost) {
@@ -897,9 +937,11 @@ int main(void) {
     }
     oled_line(4, line);
     {
-      char *b = put_str(line, "OCC "); b = put_u(b, occ_n, 1); b = put_str(b, "/2 ");
-      b = put_str(b, OVR_TXT[ovr]); *b++ = ' ';
-      b = put_u(b, (uint32_t)bright * 100 / BRIGHT_MAX, 3); *b++ = '%'; *b = 0;
+      /* "OCC1/2 AUTO L75 F60": occupancy, override, light %, fan % (0 = off) */
+      char *b = put_str(line, "OCC"); b = put_u(b, occ_n, 1); b = put_str(b, "/2 ");
+      b = put_str(b, OVR_TXT[ovr]); b = put_str(b, " L");
+      b = put_u(b, (uint32_t)bright * 100 / BRIGHT_MAX, 1); b = put_str(b, " F");
+      b = put_u(b, fan_now, 1); *b = 0;
     }
     oled_line(6, line);
     if (rf.ok) { char *b = put_str(line, "RFID OK V"); b = put_hex8(b, rc_version()); *b = 0; }
@@ -927,6 +969,7 @@ int main(void) {
     uart_puts(rf.ok ? "  RFID=ok" : "  RFID=none");
     uart_puts("  OVR="); uart_puts(OVR_TXT[ovr]);
     uart_puts(" BRT="); uart_putu((uint32_t)bright * 100 / BRIGHT_MAX); uart_putc('%');
+    uart_puts(" FAN="); uart_putu(fan_now); uart_putc('%');
     uart_puts(oled_addr ? "  OLED=ok\r\n" : "  OLED=none\r\n");
 
 heartbeat:
