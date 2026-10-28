@@ -1,8 +1,10 @@
-/* Host-side tests for Core/Inc/logic.h. No board needed:
+/* Host-side tests for Core/Inc/logic.h and Core/Inc/extras.h. No board needed:
  *   gcc -Wall -Wextra -ICore/Inc tests/host_test.c -o host_test && ./host_test
  */
 #include <stdio.h>
+#include <string.h>
 #include "logic.h"
+#include "extras.h"
 
 static int fails = 0, checks = 0;
 #define CHECK(c) do { checks++; if (!(c)) { fails++; printf("FAIL line %d: %s\n", __LINE__, #c); } } while (0)
@@ -163,9 +165,164 @@ static void test_fan(void) {
   CHECK(fan_ccr(35, 60) == 168);
 }
 
+/* ============================ v2 features ============================ */
+static const card_t CARDS_T[] = {
+  { 0x62E26506, "TEACHER", ROLE_TEACHER },
+  { 0x11112222, "RAHULKUMARX", ROLE_STUDENT },      /* longer than 8: cut */
+};
+#define NC (int)(sizeof CARDS_T / sizeof CARDS_T[0])
+
+static void test_cards(void) {
+  char n[9];
+  CHECK(card_find(CARDS_T, NC, 0x62E26506) == 0);
+  CHECK(card_find(CARDS_T, NC, 0xDEADBEEF) == -1);
+  CHECK(card_is_teacher(CARDS_T, NC, 0x62E26506));
+  CHECK(!card_is_teacher(CARDS_T, NC, 0x11112222));
+  CHECK(!card_is_teacher(CARDS_T, NC, 0xDEADBEEF));
+  card_name(CARDS_T, NC, 0x62E26506, n); CHECK(strcmp(n, "TEACHER") == 0);
+  card_name(CARDS_T, NC, 0x11112222, n); CHECK(strcmp(n, "RAHULKUM") == 0);
+  card_name(CARDS_T, NC, 0xDEADBEEF, n); CHECK(strcmp(n, "C-BEEF") == 0);
+  card_name(CARDS_T, NC, 0x0000000A, n); CHECK(strcmp(n, "C-000A") == 0);
+}
+
+static void test_roster_helpers(void) {
+  roster_t r; roster_clear(&r);
+  int slots[ROSTER_MAX];
+  CHECK(roster_inside(&r, slots) == 0);
+  roster_tap(&r, 0xA, 0, 3000000); roster_tap(&r, 0xB, 0, 3000000); roster_tap(&r, 0xC, 0, 3000000);
+  CHECK(roster_find(&r, 0xB) == 1);
+  CHECK(roster_find(&r, 0xD) == -1);
+  CHECK(roster_inside(&r, slots) == 3 && slots[0] == 0 && slots[2] == 2);
+  roster_force_out(&r, 1);
+  CHECK(roster_count(&r) == 2);
+  CHECK(roster_inside(&r, slots) == 2 && slots[1] == 2);
+  /* the forced-out card's next tap is an entry again */
+  CHECK(roster_tap(&r, 0xB, 10000000, 3000000) == TAP_IN);
+  roster_force_out(&r, -1); roster_force_out(&r, ROSTER_MAX);   /* out of range: no-op */
+  CHECK(roster_count(&r) == 3);
+}
+
+static void test_knob(void) {
+  CHECK(knob_pick(0, 1, 0) == 0);
+  CHECK(knob_pick(4095, 1, 0) == 0);
+  CHECK(knob_pick(0, 4, 255) == 0);
+  CHECK(knob_pick(4095, 4, 255) == 3);
+  CHECK(knob_pick(2100, 4, 255) == 2);
+  /* boundary between step 1 and 2 is 2048: hysteresis keeps the current step */
+  CHECK(knob_pick(2060, 4, 1) == 1);
+  CHECK(knob_pick(2200, 4, 1) == 2);
+  CHECK(knob_pick(2000, 4, 2) == 2);
+  CHECK(knob_pick(1900, 4, 2) == 1);
+  CHECK(knob_pick(5000, 4, 0) == 3);                 /* clamp */
+  /* every step is reachable for 31 steps (late-minute setting 0..30) */
+  int seen[31] = {0};
+  for (int a = 0; a < 4096; a += 16) seen[knob_pick((uint16_t)a, 31, 255)] = 1;
+  int all = 1; for (int i = 0; i < 31; i++) all &= seen[i];
+  CHECK(all);
+}
+
+static void test_pickup(void) {
+  pickup_t p = { false, 0 };
+  CHECK(pickup_update(&p, 100, 900, 40));            /* not held: knob in control */
+  pickup_hold(&p);
+  CHECK(!pickup_update(&p, 100, 900, 40));           /* far below */
+  CHECK(!pickup_update(&p, 500, 900, 40));
+  CHECK(pickup_update(&p, 880, 900, 40));            /* within window: released */
+  CHECK(pickup_update(&p, 100, 900, 40));            /* stays released */
+  pickup_hold(&p);
+  CHECK(!pickup_update(&p, 200, 600, 40));           /* below */
+  CHECK(pickup_update(&p, 990, 600, 40));            /* jumped past in one step: crossing counts */
+  pickup_hold(&p);
+  CHECK(!pickup_update(&p, 999, 100, 40));           /* above */
+  CHECK(!pickup_update(&p, 700, 100, 40));
+  CHECK(pickup_update(&p, 50, 100, 40));             /* crossed from above */
+}
+
+static void test_log(void) {
+  evlog_t l = {0};
+  CHECK(log_get(&l, 0) == 0);
+  log_push(&l, 100, 0xA, EV_IN);
+  log_push(&l, 200, 0xB, EV_LATE);
+  CHECK(l.count == 2);
+  CHECK(log_get(&l, 0)->uid == 0xB && log_get(&l, 0)->type == EV_LATE);
+  CHECK(log_get(&l, 1)->sod == 100);
+  CHECK(log_get(&l, 2) == 0);
+  for (int i = 0; i < 40; i++) log_push(&l, 1000 + i, i, EV_OUT);
+  CHECK(l.count == LOG_MAX);
+  CHECK(log_get(&l, 0)->sod == 1039);
+  CHECK(log_get(&l, LOG_MAX - 1)->sod == 1039 - (LOG_MAX - 1));
+  CHECK(log_get(&l, LOG_MAX) == 0);
+  CHECK(strcmp(ev_txt(EV_START), "START") == 0 && strcmp(ev_txt(EV_RESET), "RESET") == 0);
+  CHECK(strcmp(ev_txt(200), "?") == 0);
+}
+
+static void test_session(void) {
+  session_t s; session_init(&s, 10);
+  const uint32_t T0 = sod_of(9, 0, 0);
+  CHECK(sod_of(23, 59, 59) == 86399);
+  CHECK(sod_elapsed(sod_of(23, 50, 0), sod_of(0, 10, 0)) == 20 * 60);   /* across midnight */
+  /* no session: every entry is a plain IN, nothing recorded */
+  CHECK(session_student_in(&s, 0xA, T0) == EV_IN);
+  CHECK(s.n_att == 0);
+  /* teacher arrives at 09:00 with 0xA already inside */
+  uint32_t inside[] = { 0xA };
+  session_start(&s, 0x62E26506, T0, inside, 1);
+  CHECK(s.active && s.n_att == 1 && !session_is_late(&s, 0xA));
+  CHECK(session_student_in(&s, 0xB, T0 + 9 * 60) == EV_IN);            /* 9 min: on time */
+  CHECK(session_student_in(&s, 0xC, T0 + 10 * 60) == EV_IN);           /* exactly 10: on time */
+  CHECK(session_student_in(&s, 0xD, T0 + 10 * 60 + 1) == EV_LATE);     /* 10 min 1 s: late */
+  CHECK(session_is_late(&s, 0xD) && !session_is_late(&s, 0xB));
+  CHECK(session_student_in(&s, 0xD, T0 + 30 * 60) == EV_IN);           /* comes back: not late twice */
+  CHECK(session_student_in(&s, 0xB, T0 + 40 * 60) == EV_IN);           /* on-time student stays on time */
+  CHECK(!session_is_late(&s, 0xB));
+  CHECK(s.n_att == 4 && session_late_count(&s) == 1);
+  session_end(&s, T0 + 50 * 60);
+  CHECK(!s.active && s.has_last && s.last_present == 4 && s.last_late == 1);
+  CHECK(s.last_end - s.last_start == 50 * 60);
+  session_end(&s, T0 + 60 * 60);                                         /* ending twice: no-op */
+  CHECK(s.last_end == T0 + 50 * 60);
+  /* new session starts clean */
+  session_start(&s, 0x62E26506, T0 + 3600, 0, 0);
+  CHECK(s.n_att == 0 && session_late_count(&s) == 0);
+  /* late_min = 0: any entry after the start second is late */
+  session_init(&s, 0);
+  session_start(&s, 1, T0, 0, 0);
+  CHECK(session_student_in(&s, 0xE, T0) == EV_IN);
+  CHECK(session_student_in(&s, 0xF, T0 + 1) == EV_LATE);
+  /* attendance list is bounded */
+  session_init(&s, 10); session_start(&s, 1, T0, 0, 0);
+  for (int i = 0; i < ATT_MAX + 5; i++) session_student_in(&s, 0x100 + i, T0);
+  CHECK(s.n_att == ATT_MAX);
+}
+
+static void test_hist(void) {
+  hist_t h = {0};
+  uint8_t lo, hi;
+  CHECK(!hist_range(&h, 4, &lo, &hi));
+  hist_push(&h, HIST_GAP);
+  CHECK(!hist_range(&h, 4, &lo, &hi));                 /* only gaps */
+  hist_push(&h, 25); hist_push(&h, 26);
+  CHECK(h.count == 3 && hist_get(&h, 0) == HIST_GAP && hist_get(&h, 2) == 26);
+  CHECK(hist_range(&h, 4, &lo, &hi) && hi - lo >= 4 && lo <= 25 && hi >= 26);
+  for (int i = 0; i < HIST_N + 10; i++) hist_push(&h, (uint8_t)(i % 50));
+  CHECK(h.count == HIST_N);
+  CHECK(hist_get(&h, HIST_N - 1) == (HIST_N + 9) % 50);  /* newest */
+  CHECK(hist_get(&h, 0) == 10 % 50);                     /* oldest kept */
+  hist_t z = {0}; hist_push(&z, 0); hist_push(&z, 0);
+  CHECK(hist_range(&z, 4, &lo, &hi) && lo == 0 && hi == 4);  /* cannot go below 0 */
+  CHECK(graph_y(10, 10, 20, 56) == 55);                  /* min at the bottom */
+  CHECK(graph_y(20, 10, 20, 56) == 0);                   /* max at the top */
+  CHECK(graph_y(5, 10, 20, 56) == 55 && graph_y(30, 10, 20, 56) == 0);
+  CHECK(graph_y(15, 10, 20, 56) == 27);                  /* middle: 55 - 27.5 rounded */
+  int mono = 1;
+  for (int v = 10; v < 20; v++) if (graph_y((uint8_t)(v + 1), 10, 20, 56) > graph_y((uint8_t)v, 10, 20, 56)) mono = 0;
+  CHECK(mono);
+}
+
 int main(void) {
   test_pot(); test_led_duty(); test_datetime(); test_fan();
   test_roster(); test_roster_full(); test_roster_wrap(); test_allowed();
+  test_cards(); test_roster_helpers(); test_knob(); test_pickup(); test_log(); test_session(); test_hist();
   printf("%d checks, %d failed\n", checks, fails);
   return fails ? 1 : 0;
 }

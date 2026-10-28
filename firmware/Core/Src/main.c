@@ -16,6 +16,8 @@
  * FAN     PA8 (D7)  TIM1_CH1 -> 220R -> IRLZ44N gate (10k gate-GND), 20 kHz PWM.
  *         Motor on the 9 V battery, 1N4007 across it, battery (-) to Nucleo GND.
  * BUTTON  B1 (blue, on the board), PC13, EXTI line 13 interrupt
+ * MODE    PB10 (D6),  push button to GND, EXTI line 10   } FEATURES build only
+ * SELECT  PA7  (D11), push button to GND, EXTI line 7    } internal pull-ups
  * HC-SR04 on 5V, everything else 3V3, grounds common.
  *
  * Each zone's mode (OFF/AUTO/DIM/MAX) is a #define below; the pot sets how
@@ -24,14 +26,19 @@
  * inside, at the speed set by the fan pot, capped at FAN_MAX_PCT of the battery.
  * Occupancy is debounced: needs OCC_MS of continuous detection to go
  * occupied, VACANT_MS of continuous clear to go back to empty. Tapping a card
- * at the door toggles that card in/out of the headcount; a tap-in also makes
- * both zones count as occupied for ENTRY_BOOST_MS.
+ * at the door toggles that card in/out of the headcount. Lights follow the
+ * zone sensors only; the headcount drives the fan.
+ *
+ * FEATURES 1 (v2) adds: MODE/SELECT buttons and five screens (HOME, ROSTER,
+ * LOG, CLASS, GRAPH), the light pot doubling as a menu knob off HOME, card
+ * names, teacher sessions with LATE marking, an event log and OLED graphs.
+ * FEATURES 0 builds the v1 behaviour and screen.
  *
  * Clock: on-chip RTC, 32.768 kHz LSE crystal (falls back to the rough LSI if
  * the crystal is missing). Set from the build time on flashing; set it exactly
  * over the serial port with "T 08:30:00" and "D 18/10/26".
  *
- * Interrupts: EXTI15_10 (button) and USART2 RX (serial commands). Everything
+ * Interrupts: EXTI15_10 (buttons), EXTI9_5 (SELECT, v2) and USART2 RX (serial commands). Everything
  * else is polled. HSI 16MHz, no PLL. UART2 prints raw state every loop and
  * LD2 toggles as a heartbeat. Pure logic lives in logic.h (host tested).
  */
@@ -40,6 +47,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "logic.h"
+
+#ifndef FEATURES
+#define FEATURES    1   /* 1 = v2 extras (screens, buttons, sessions, graphs). 0 = v1 */
+#endif
+#if FEATURES
+#include "extras.h"
+#endif
 
 #define ZONE_A_MODE 1   /* 0 off, 1 auto, 2 dim, 3 max */
 #define ZONE_B_MODE 1
@@ -58,12 +72,19 @@
 #define PING_GAP_MS 60
 #define I2C_TIMEOUT_US 2000
 
-#define ENTRY_BOOST_MS 30000UL       /* after a tap-in, both zones count as occupied */
+#define ENTRY_BOOST_MS 30000UL       /* after a tap-in, the stale-roster timer waits this long */
 #define TAP_LOCKOUT_MS 3000UL        /* same card ignored this long after a sighting */
 #define STALE_RESET_MS 120000UL      /* headcount > 0 but zones empty this long: clear it */
+#define STALE_CLASS_MS 600000UL      /* v2: same, while a class is live (teacher may stand outside the zones) */
 #define POT_SAMPLES    8             /* ADC reads averaged per pot reading */
 #define BTN_DEBOUNCE_US 250000UL     /* ignore button edges closer than this */
 #define RX_QUIET_US    5000000UL     /* hold the status line this long after you type */
+
+#define LATE_MIN_DEFAULT 10          /* v2: minutes after the teacher's tap before LATE */
+#define HIST_PERIOD_US 10000000UL    /* v2: one graph sample every 10 s, 108 samples = 18 min */
+#define BTN_QUIET_US   30000UL       /* v2 buttons: an edge counts only after 30 ms of quiet */
+#define CONFIRM_US     3000000UL     /* v2: second SELECT within this to confirm */
+#define TOAST_US       2500000UL     /* v2: how long a status message stays on the bottom line */
 
 #define DIST_NO_ECHO 0xFFFE
 #define DIST_FAR     0xFFFF
@@ -81,6 +102,18 @@ static const pin_t LED  = {GPIOA, 5};        /* LD2 */
 static const pin_t LDR  = {GPIOB, 0};
 static const pin_t RC_CS  = {GPIOB, 12};    /* RC522 SDA/SS, software chip select */
 static const pin_t RC_RST = {GPIOC, 5};
+#if FEATURES
+static const pin_t BTN_MODE = {GPIOB, 10};   /* D6  */
+static const pin_t BTN_SEL  = {GPIOA, 7};    /* D11 */
+
+/* Card names. UIDs are printed on the serial log when a card is tapped.
+ * Names longer than 8 characters are cut on the OLED. */
+static const card_t CARDS[] = {
+  { 0x62E26506, "TEACHER", ROLE_TEACHER },
+  /* { 0xAABBCCDD, "RAHUL", ROLE_STUDENT }, */
+};
+#define N_CARDS ((int)(sizeof CARDS / sizeof CARDS[0]))
+#endif
 
 /* Cards that may open the door. 0 ends the list; {0} alone = accept any card.
  * Tap a card, read its UID off the UART or OLED, paste it here as 0xAABBCCDD. */
@@ -139,6 +172,13 @@ static volatile bool     rx_any;             /* anything typed since boot */
 /* Blue button: the ISR only counts presses; main() decides what they mean. */
 static volatile uint32_t btn_presses;
 static volatile uint32_t btn_last_us;
+#if FEATURES
+/* MODE and SELECT: same idea, but the ISR sees both edges and counts a press
+ * only on a falling edge that follows 30 ms of quiet. Contact bounce (on
+ * press and on release) always comes in quick bursts, so it is rejected. */
+static volatile uint32_t mode_presses, sel_presses;
+static volatile uint32_t mode_edge_us, sel_edge_us;
+#endif
 
 void USART2_IRQHandler(void) {
   uint32_t sr = USART2->SR;
@@ -152,12 +192,32 @@ void USART2_IRQHandler(void) {
 }
 
 void EXTI15_10_IRQHandler(void) {
+  uint32_t now = TIM2->CNT;
   if (EXTI->PR & (1U << 13)) {
     EXTI->PR = (1U << 13);                   /* write 1 to clear the pending flag */
-    uint32_t now = TIM2->CNT;
     if (now - btn_last_us >= BTN_DEBOUNCE_US) { btn_presses++; btn_last_us = now; }
   }
+#if FEATURES
+  if (EXTI->PR & (1U << 10)) {               /* MODE on PB10 */
+    EXTI->PR = (1U << 10);
+    bool quiet = (now - mode_edge_us) >= BTN_QUIET_US;
+    mode_edge_us = now;
+    if (quiet && !(GPIOB->IDR & (1U << 10))) mode_presses++;
+  }
+#endif
 }
+
+#if FEATURES
+void EXTI9_5_IRQHandler(void) {
+  if (EXTI->PR & (1U << 7)) {                /* SELECT on PA7 */
+    EXTI->PR = (1U << 7);
+    uint32_t now = TIM2->CNT;
+    bool quiet = (now - sel_edge_us) >= BTN_QUIET_US;
+    sel_edge_us = now;
+    if (quiet && !(GPIOA->IDR & (1U << 7))) sel_presses++;
+  }
+}
+#endif
 
 static void uart_rx_init(void) {
   pin_t rx = {GPIOA, 3};
@@ -177,6 +237,21 @@ static void button_init(void) {
   EXTI->IMR  |= (1U << 13);
   NVIC_EnableIRQ(EXTI15_10_IRQn);
 }
+
+#if FEATURES
+static void buttons2_init(void) {           /* after button_init: SYSCFG clock is on */
+  pin_mode(BTN_MODE, 0); pin_pull(BTN_MODE, 1);
+  pin_mode(BTN_SEL, 0);  pin_pull(BTN_SEL, 1);
+  SYSCFG->EXTICR[2] = (SYSCFG->EXTICR[2] & ~SYSCFG_EXTICR3_EXTI10) | SYSCFG_EXTICR3_EXTI10_PB;
+  SYSCFG->EXTICR[1] &= ~SYSCFG_EXTICR2_EXTI7;          /* 0 = port A */
+  uint32_t m = (1U << 10) | (1U << 7);
+  EXTI->FTSR |= m;                           /* both edges: see the ISR */
+  EXTI->RTSR |= m;
+  EXTI->PR    = m;
+  EXTI->IMR  |= m;
+  NVIC_EnableIRQ(EXTI9_5_IRQn);              /* EXTI15_10 is already enabled */
+}
+#endif
 
 static int uart_getc(void) {
   if (rx_tail == rx_head) return -1;
@@ -524,6 +599,10 @@ static void uart_datetime(void) {
 
 /* Serial commands, typed into PuTTY / Tera Term / Arduino serial monitor:
  *   T 08:30:00   set time       D 18/10/26   set date       ?   show both */
+#if FEATURES
+static bool feature_command(char op);       /* R, L, S: defined with the screens */
+#endif
+
 static void handle_command(char *cmd) {
   while (*cmd == ' ') cmd++;
   char op = *cmd;
@@ -540,8 +619,15 @@ static void handle_command(char *cmd) {
                              : "Bad date. Use: D DD/MM/YY\r\n");
   } else if (op == '?' || op == 0) {
     uart_datetime();
+#if FEATURES
+  } else if (feature_command(op)) {
+    /* handled */
+  } else {
+    uart_puts("Commands: T 08:30:00 | D 18/10/26 | ? | R roster | L log | S class\r\n");
+#else
   } else {
     uart_puts("Commands: T 08:30:00 | D 18/10/26 | ?\r\n");
+#endif
   }
 }
 
@@ -714,6 +800,95 @@ static void uart_puthex32(uint32_t v) {
   for (int i = 3; i >= 0; i--) uart_puthex8((uint8_t)(v >> (i * 8)));
 }
 
+#if FEATURES
+/* ===================================================================== */
+/* v2: class session, event log, graph history. Decisions are in         */
+/* extras.h (host tested); this part feeds them times and prints.        */
+/* ===================================================================== */
+static session_t sess;
+static evlog_t   evlog;
+static hist_t    hist[3];                   /* 0 temperature C, 1 humidity %, 2 people inside */
+static uint32_t  in_sod[ROSTER_MAX];        /* time each roster slot last tapped IN */
+static uint8_t   late_min = LATE_MIN_DEFAULT;
+static bool      summary_due;               /* a class just ended: print it when safe */
+
+#define BKP_LATE_TAG 0xA5C1A500UL           /* RTC->BKP1R = tag | minutes; survives a reset */
+
+static uint32_t now_sod(void) {
+  if (rtc_ok) { dt_t t; rtc_read(&t); return sod_of(t.h, t.m, t.s); }
+  return (micros() / 1000000UL) % DAY_S;    /* no RTC: uptime, so durations are still right */
+}
+
+static void name_of(uint32_t uid, char *out) {
+  if (uid == 0) { out[0] = 'R'; out[1] = 'O'; out[2] = 'S'; out[3] = 'T'; out[4] = 'E'; out[5] = 'R'; out[6] = 0; return; }
+  card_name(CARDS, N_CARDS, uid, out);
+}
+
+static void uart_hhmm(uint32_t sod) {
+  uart_put2((uint8_t)(sod / 3600)); uart_putc(':'); uart_put2((uint8_t)(sod / 60 % 60));
+}
+
+static void print_attendance(void) {
+  char nm[9];
+  if (!sess.n_att) { uart_puts("  (no students)\r\n"); return; }
+  for (int i = 0; i < sess.n_att; i++) {
+    card_name(CARDS, N_CARDS, sess.att[i].uid, nm);
+    uart_puts("  "); uart_puts(nm); uart_puts("  "); uart_puthex32(sess.att[i].uid);
+    uart_puts("  first in "); uart_hhmm(sess.att[i].first_sod);
+    uart_puts(sess.att[i].late ? "  LATE\r\n" : "  on time\r\n");
+  }
+}
+
+/* End the running class. Printing waits for summary_flush(), so a summary
+ * never lands in the middle of another serial line. */
+static void class_stop(uint32_t now) {
+  if (!sess.active) return;
+  session_end(&sess, now);
+  log_push(&evlog, now, sess.teacher_uid, EV_END);
+  summary_due = true;
+}
+
+static void summary_flush(void) {
+  if (!summary_due) return;
+  summary_due = false;
+  uart_time(); uart_puts("CLASS END  "); uart_hhmm(sess.last_start); uart_putc('-'); uart_hhmm(sess.last_end);
+  uart_puts("  ("); uart_putu(sod_elapsed(sess.last_start, sess.last_end) / 60); uart_puts(" min)  present=");
+  uart_putu(sess.last_present); uart_puts(" late="); uart_putu(sess.last_late); uart_puts("\r\n");
+  print_attendance();
+}
+
+static void feature_tap_in(uint32_t uid) {
+  uint32_t now = now_sod();
+  int slot = roster_find(&rf.roster, uid);
+  if (slot >= 0) in_sod[slot] = now;
+  if (card_is_teacher(CARDS, N_CARDS, uid)) {
+    log_push(&evlog, now, uid, EV_IN);
+    if (!sess.active) {                     /* teacher arrives: class starts */
+      int sl[ROSTER_MAX], n = roster_inside(&rf.roster, sl), k = 0;
+      uint32_t ids[ROSTER_MAX];
+      for (int i = 0; i < n; i++) {
+        uint32_t u = rf.roster.e[sl[i]].uid;
+        if (!card_is_teacher(CARDS, N_CARDS, u)) ids[k++] = u;   /* already here = on time */
+      }
+      session_start(&sess, uid, now, ids, k);
+      log_push(&evlog, now, uid, EV_START);
+      rf.last_txt = "START";
+      uart_puts(" CLASS START");
+    }
+  } else {
+    ev_t e = session_student_in(&sess, uid, now);
+    log_push(&evlog, now, uid, e);
+    if (e == EV_LATE) { rf.last_txt = "LATE"; uart_puts(" LATE"); }
+  }
+}
+
+static void feature_tap_out(uint32_t uid) {
+  uint32_t now = now_sod();
+  log_push(&evlog, now, uid, EV_OUT);
+  if (sess.active && uid == sess.teacher_uid) { class_stop(now); rf.last_txt = "END"; }
+}
+#endif
+
 /* Poll once. Cheap when nobody is there (about 8 ms for the timeout). */
 static void rfid_service(void) {
   if (!rf.ok) return;
@@ -728,9 +903,15 @@ static void rfid_service(void) {
   }
   rf.last_uid = uid;
   uart_time(); uart_puts("RFID "); uart_puthex32(uid); uart_puts(" ");
+#if FEATURES
+  { char nm[9]; card_name(CARDS, N_CARDS, uid, nm); uart_puts(nm); uart_puts(" "); }
+#endif
   if (!uid_allowed(ALLOWED_UIDS, uid)) {
     rf.last_txt = "DENY";
     uart_puts("DENIED\r\n");
+#if FEATURES
+    log_push(&evlog, now_sod(), uid, EV_DENY);
+#endif
     return;
   }
   switch (roster_tap(&rf.roster, uid, micros(), TAP_LOCKOUT_MS * 1000UL)) {
@@ -738,20 +919,32 @@ static void rfid_service(void) {
       rf.last_txt = "IN";
       rf.boost_on = true; rf.boost_t0 = micros();
       uart_puts("IN");
+#if FEATURES
+      feature_tap_in(uid);
+#endif
       break;
     case TAP_OUT:
       rf.last_txt = "OUT";
       if (rf_count() == 0) rf.boost_on = false;
       uart_puts("OUT");
+#if FEATURES
+      feature_tap_out(uid);
+#endif
       break;
     case TAP_FULL:
       rf.last_txt = "FULL";
       uart_puts("ROSTER FULL");
+#if FEATURES
+      log_push(&evlog, now_sod(), uid, EV_FULL);
+#endif
       break;
     default:
       return;                                        /* same card still on the reader */
   }
   uart_puts("  inside="); uart_putu((uint32_t)rf_count()); uart_puts("\r\n");
+#if FEATURES
+  summary_flush();
+#endif
 }
 
 /* delay_ms that keeps listening for cards while it waits */
@@ -793,6 +986,12 @@ static void setup(void) {
 #endif
   uart_rx_init();
   button_init();
+#if FEATURES
+  buttons2_init();
+  { uint32_t b = RTC->BKP1R;                /* saved LATE threshold, if any */
+    if ((b & 0xFFFFFF00UL) == BKP_LATE_TAG && (b & 0xFFU) <= 30) late_min = (uint8_t)(b & 0xFFU); }
+  session_init(&sess, late_min);
+#endif
   uart_puts("Commands: T 08:30:00 | D 18/10/26 | ?\r\n");
 
   i2c_init();
@@ -811,6 +1010,7 @@ static void setup(void) {
   delay_ms(1000);
 }
 
+#if !FEATURES
 static char *put_hex8(char *b, uint8_t v) {
   const char *h = "0123456789ABCDEF";
   *b++ = h[v >> 4]; *b++ = h[v & 15];
@@ -820,6 +1020,382 @@ static char *put_hex32(char *b, uint32_t v) {
   const char *h = "0123456789ABCDEF";
   for (int i = 7; i >= 0; i--) *b++ = h[(v >> (i * 4)) & 15];
   return b;
+}
+#endif
+
+#if FEATURES
+/* ===================================================================== */
+/* v2 screens. Each pass draws into fb, a 1 KB copy of the display, then */
+/* fb_flush() sends only the 128-byte pages that changed since last time.*/
+/* ===================================================================== */
+static uint8_t fb[8][128];
+static uint8_t fb_sent[8][128];
+static bool    fb_sent_ok[8];
+
+static void fb_invalidate(void) { for (int p = 0; p < 8; p++) fb_sent_ok[p] = false; }
+static void fb_clear(void) {
+  for (int p = 0; p < 8; p++) for (int x = 0; x < 128; x++) fb[p][x] = 0;
+}
+static void fb_text(uint8_t row, uint8_t col, const char *s) {
+  for (; *s && col < 21; s++, col++) {
+    const uint8_t *g = font5x7[glyph_index(*s)];
+    for (int k = 0; k < 5; k++) fb[row][col * 6 + k] = g[k];
+  }
+}
+static void fb_invert_row(uint8_t row) { for (int x = 0; x < 128; x++) fb[row][x] ^= 0xFF; }
+static void fb_pixel(int x, int y) {
+  if (x >= 0 && x < 128 && y >= 0 && y < 64) fb[y >> 3][x] |= (uint8_t)(1U << (y & 7));
+}
+static void fb_vline(int x, int y0, int y1) {
+  if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+  for (int y = y0; y <= y1; y++) fb_pixel(x, y);
+}
+
+static void fb_flush(void) {
+  if (!oled_addr) return;
+  for (uint8_t p = 0; p < 8; p++) {
+    bool same = fb_sent_ok[p];
+    for (int x = 0; same && x < 128; x++) if (fb[p][x] != fb_sent[p][x]) same = false;
+    if (same) continue;
+    oled_cmd(0xB0 | p); oled_cmd(0x02); oled_cmd(0x10);
+    if (!i2c_write(oled_addr, 0x40, fb[p], 128)) { oled_addr = 0; fb_invalidate(); return; }
+    for (int x = 0; x < 128; x++) fb_sent[p][x] = fb[p][x];
+    fb_sent_ok[p] = true;
+    rfid_service();                         /* keep listening for cards while drawing */
+  }
+}
+
+typedef enum { SCR_HOME, SCR_ROSTER, SCR_LOG, SCR_CLASS, SCR_GRAPH, SCR_COUNT } scr_t;
+static const char *const SCR_NAME[SCR_COUNT] = { "HOME", "ROSTER", "LOG", "CLASS", "GRAPH" };
+static const char *const OVR_NAME[3] = { "AUTO", "ON", "OFF" };
+
+static scr_t    scr = SCR_HOME;
+static uint8_t  pick = 255;                 /* knob-chosen row (ROSTER) or scroll (LOG) */
+static uint8_t  late_pick = 255;            /* knob value on CLASS, 0..30 min */
+static uint8_t  graph_kind;                 /* 0 temp, 1 humidity, 2 people */
+static bool     graph_hold;
+static hist_t   graph_snap[3];
+static uint32_t confirm_uid, confirm_t0;    /* ROSTER: first SELECT arms, second confirms */
+static char     toast[22];
+static uint32_t toast_t0;
+static bool     toast_on;
+static pickup_t bright_pick;
+
+typedef struct {                            /* what the screens need from main() */
+  uint16_t cm[2]; bool occ[2]; int occ_n;
+  bool dark, dht_ok; uint8_t temp, hum;
+  uint16_t bright; uint8_t fan; ovr_t ovr;
+} view_t;
+
+static char *put_hhmm(char *b, uint32_t sod) {
+  b = put_u2(b, sod / 3600); *b++ = ':'; return put_u2(b, sod / 60 % 60);
+}
+static char *put_pad(char *b, const char *s, int w) {
+  int n = 0;
+  while (*s && n < w) { *b++ = *s++; n++; }
+  while (n < w) { *b++ = ' '; n++; }
+  return b;
+}
+static void set_toast(const char *a, const char *b) {
+  int n = 0;
+  while (*a && n < 21) toast[n++] = *a++;
+  while (b && *b && n < 21) toast[n++] = *b++;
+  toast[n] = 0;
+  toast_on = true; toast_t0 = micros();
+}
+
+/* ---------------------------------------------------------- serial dumps */
+static void print_log_csv(void) {
+  char nm[9];
+  uart_puts("time,uid,name,event\r\n");
+  for (int i = evlog.count - 1; i >= 0; i--) {         /* oldest first */
+    const event_t *e = log_get(&evlog, i);
+    name_of(e->uid, nm);
+    uart_hhmm(e->sod); uart_putc(':'); uart_put2((uint8_t)(e->sod % 60)); uart_putc(',');
+    uart_puthex32(e->uid); uart_putc(','); uart_puts(nm); uart_putc(','); uart_puts(ev_txt(e->type));
+    uart_puts("\r\n");
+  }
+}
+static void print_roster(void) {
+  int sl[ROSTER_MAX], n = roster_inside(&rf.roster, sl);
+  char nm[9];
+  uart_puts("Inside: "); uart_putu((uint32_t)n); uart_puts("\r\n");
+  for (int i = 0; i < n; i++) {
+    uint32_t uid = rf.roster.e[sl[i]].uid;
+    card_name(CARDS, N_CARDS, uid, nm);
+    uart_puts("  "); uart_puts(nm); uart_puts("  "); uart_puthex32(uid);
+    uart_puts("  since "); uart_hhmm(in_sod[sl[i]]);
+    if (card_is_teacher(CARDS, N_CARDS, uid)) uart_puts("  TEACHER");
+    else if (sess.active && session_is_late(&sess, uid)) uart_puts("  LATE");
+    uart_puts("\r\n");
+  }
+}
+static void print_class(void) {
+  if (sess.active) {
+    uart_puts("Class LIVE since "); uart_hhmm(sess.start_sod);
+    uart_puts(", "); uart_putu(sod_elapsed(sess.start_sod, now_sod()) / 60);
+    uart_puts(" min, late after "); uart_putu(late_min); uart_puts(" min\r\n");
+    print_attendance();
+  } else if (sess.has_last) {
+    uart_puts("No class running. Last: "); uart_hhmm(sess.last_start); uart_putc('-'); uart_hhmm(sess.last_end);
+    uart_puts("  present="); uart_putu(sess.last_present); uart_puts(" late="); uart_putu(sess.last_late);
+    uart_puts("\r\n");
+  } else {
+    uart_puts("No class yet. Late after "); uart_putu(late_min); uart_puts(" min\r\n");
+  }
+}
+static bool feature_command(char op) {
+  if (op == 'R') { print_roster(); return true; }
+  if (op == 'L') { print_log_csv(); return true; }
+  if (op == 'S') { print_class();  return true; }
+  return false;
+}
+
+/* ------------------------------------------------------------ buttons */
+static void ui_next_screen(void) {
+  if (scr == SCR_HOME) pickup_hold(&bright_pick);    /* knob leaves the lights */
+  scr = (scr_t)((scr + 1) % SCR_COUNT);
+  pick = 255; late_pick = 255; confirm_uid = 0; toast_on = false;
+}
+
+static void ui_select(void) {
+  uint32_t now = micros();
+  char nm[9], b[22], *p;
+  switch (scr) {
+  case SCR_HOME:
+    set_toast("MODE = NEXT SCREEN", 0);
+    break;
+  case SCR_ROSTER: {
+    int sl[ROSTER_MAX], n = roster_inside(&rf.roster, sl);
+    if (!n) { set_toast("NOBODY INSIDE", 0); break; }
+    int slot = sl[pick < n ? pick : n - 1];
+    uint32_t uid = rf.roster.e[slot].uid;
+    card_name(CARDS, N_CARDS, uid, nm);
+    if (confirm_uid == uid && now - confirm_t0 < CONFIRM_US) {
+      uint32_t t = now_sod();
+      roster_force_out(&rf.roster, slot);
+      log_push(&evlog, t, uid, EV_FORCE);
+      uart_time(); uart_puts("FORCED OUT "); uart_puts(nm); uart_puts("\r\n");
+      if (sess.active && uid == sess.teacher_uid) class_stop(t);
+      if (rf_count() == 0) rf.boost_on = false;
+      rf.last_uid = uid; rf.last_txt = "FORCE";
+      confirm_uid = 0;
+      set_toast("OUT: ", nm);
+    } else {
+      confirm_uid = uid; confirm_t0 = now;
+      set_toast("AGAIN=OUT ", nm);
+    }
+    break; }
+  case SCR_LOG:
+    print_log_csv();
+    set_toast("LOG SENT TO SERIAL", 0);
+    break;
+  case SCR_CLASS:
+    if (late_pick > 30) break;
+    late_min = late_pick; sess.late_min = late_min;
+    RTC->BKP1R = BKP_LATE_TAG | late_min;              /* kept through a reset */
+    p = put_str(b, "SAVED: "); p = put_u(p, late_min, 1); p = put_str(p, " MIN"); *p = 0;
+    set_toast(b, 0);
+    break;
+  case SCR_GRAPH:
+    graph_hold = !graph_hold;
+    if (graph_hold) for (int i = 0; i < 3; i++) graph_snap[i] = hist[i];
+    break;
+  default: break;
+  }
+}
+
+/* --------------------------------------------------------- light knob */
+__attribute__((unused)) static void ui_knob(uint16_t raw, uint16_t *bright) {
+  int sl[ROSTER_MAX], n;
+  switch (scr) {
+  case SCR_HOME: {
+    int target = BRIGHT_MIN + (int)raw * (BRIGHT_MAX - BRIGHT_MIN) / 4095;
+    if (pickup_update(&bright_pick, target, *bright, 40)) *bright = pot_brightness(raw, *bright);
+    break; }
+  case SCR_ROSTER:
+    n = roster_inside(&rf.roster, sl);
+    pick = knob_pick(raw, (uint8_t)(n ? n : 1), pick);
+    break;
+  case SCR_LOG:
+    pick = knob_pick(raw, (uint8_t)(evlog.count > 6 ? evlog.count - 5 : 1), pick);
+    break;
+  case SCR_CLASS:
+    late_pick = knob_pick(raw, 31, late_pick);
+    break;
+  case SCR_GRAPH:
+    graph_kind = knob_pick(raw, 3, graph_kind);
+    break;
+  default: break;
+  }
+}
+
+/* ------------------------------------------------------------ drawing */
+static void draw_title(const char *left, const char *right) {
+  int n = 0;
+  while (right[n]) n++;
+  fb_text(0, 0, left);
+  fb_text(0, (uint8_t)(21 - n), right);
+  fb_invert_row(0);
+}
+static void draw_hint(const char *hint) {
+  if (toast_on && micros() - toast_t0 < TOAST_US) fb_text(7, 0, toast);
+  else { toast_on = false; fb_text(7, 0, hint); }
+}
+
+static void draw_home(const view_t *v) {
+  char b[24], nm[9], *p;
+  if (rtc_ok) {
+    dt_t t; rtc_read(&t);
+    p = put_u2(b, t.h); *p++ = ':'; p = put_u2(p, t.m); *p++ = ':'; p = put_u2(p, t.s); *p = 0;
+  } else put_str(b, "NO RTC")[0] = 0;
+  draw_title(SCR_NAME[SCR_HOME], b);
+  zone_line(b, 'A', v->cm[0], v->occ[0], mode[0]); fb_text(1, 0, b);
+  zone_line(b, 'B', v->cm[1], v->occ[1], mode[1]); fb_text(2, 0, b);
+  p = put_str(b, "IN:"); p = put_u(p, (uint32_t)rf_count(), 1); *p++ = ' ';
+  if (rf.last_uid) { card_name(CARDS, N_CARDS, rf.last_uid, nm); p = put_str(p, nm); *p++ = ' '; p = put_str(p, rf.last_txt); }
+  else p = put_str(p, "NO TAPS YET");
+  *p = 0; fb_text(3, 0, b);
+  if (v->dht_ok) {
+    p = put_str(b, "T:"); p = put_u(p, v->temp, 2); p = put_str(p, "C H:"); p = put_u(p, v->hum, 2); p = put_str(p, "% ");
+  } else p = put_str(b, "DHT ERR ");
+  p = put_str(p, v->dark ? "DARK" : "BRIGHT"); *p = 0; fb_text(4, 0, b);
+  p = put_str(b, "L"); p = put_u(p, (uint32_t)v->bright * 100 / BRIGHT_MAX, 1);
+  if (bright_pick.held) *p++ = '*';                     /* knob not in control yet */
+  p = put_str(p, " F"); p = put_u(p, v->fan, 1);
+  p = put_str(p, " OVR:"); p = put_str(p, OVR_NAME[v->ovr]); *p = 0; fb_text(5, 0, b);
+  if (sess.active) {
+    p = put_str(b, "CLASS "); p = put_u(p, sod_elapsed(sess.start_sod, now_sod()) / 60, 1);
+    p = put_str(p, "M P"); p = put_u(p, sess.n_att, 1); p = put_str(p, " L"); p = put_u(p, session_late_count(&sess), 1);
+    *p = 0;
+  } else put_str(b, "NO CLASS")[0] = 0;
+  fb_text(6, 0, b);
+  p = put_str(b, "OCC "); p = put_u(p, (uint32_t)v->occ_n, 1); p = put_str(p, "/2  ");
+  p = put_str(p, rf.ok ? "RFID OK" : "NO RFID"); *p = 0;
+  draw_hint(b);
+}
+
+static void draw_roster(void) {
+  char b[24], nm[9], *p;
+  int sl[ROSTER_MAX], n = roster_inside(&rf.roster, sl);
+  if (confirm_uid && micros() - confirm_t0 >= CONFIRM_US) confirm_uid = 0;
+  p = put_u(b, (uint32_t)n, 1); p = put_str(p, " IN"); *p = 0;
+  draw_title(SCR_NAME[SCR_ROSTER], b);
+  if (!n) fb_text(3, 4, "NOBODY INSIDE");
+  int cur = pick < n ? pick : n - 1;
+  int top = cur > 5 ? cur - 5 : 0;
+  for (int k = 0; k < 6 && top + k < n; k++) {
+    int i = top + k, slot = sl[i];
+    uint32_t uid = rf.roster.e[slot].uid;
+    card_name(CARDS, N_CARDS, uid, nm);
+    p = b; *p++ = (i == cur) ? '>' : ' ';
+    p = put_pad(p, nm, 8); *p++ = ' '; p = put_hhmm(p, in_sod[slot]); *p++ = ' ';
+    if (card_is_teacher(CARDS, N_CARDS, uid)) *p++ = 'T';
+    else if (sess.active && session_is_late(&sess, uid)) *p++ = 'L';
+    *p = 0;
+    fb_text((uint8_t)(1 + k), 0, b);
+    if (i == cur) fb_invert_row((uint8_t)(1 + k));
+  }
+  draw_hint("KNOB:PICK  SEL:OUT");
+}
+
+static void draw_log(void) {
+  char b[24], nm[9], *p;
+  p = put_u(b, evlog.count, 1); p = put_str(p, " EV"); *p = 0;
+  draw_title(SCR_NAME[SCR_LOG], b);
+  if (!evlog.count) fb_text(3, 4, "NO EVENTS YET");
+  int off = (pick < 255) ? pick : 0;
+  for (int k = 0; k < 6; k++) {
+    const event_t *e = log_get(&evlog, off + k);
+    if (!e) break;
+    name_of(e->uid, nm);
+    p = put_hhmm(b, e->sod); *p++ = ' '; p = put_pad(p, nm, 8); *p++ = ' '; p = put_str(p, ev_txt(e->type)); *p = 0;
+    fb_text((uint8_t)(1 + k), 0, b);
+  }
+  draw_hint("KNOB:SCROLL SEL:CSV");
+}
+
+static void draw_class(void) {
+  char b[24], nm[9], *p;
+  draw_title(SCR_NAME[SCR_CLASS], sess.active ? "LIVE" : "IDLE");
+  if (sess.active) {
+    p = put_str(b, "SINCE "); p = put_hhmm(p, sess.start_sod); p = put_str(p, "  ");
+    p = put_u(p, sod_elapsed(sess.start_sod, now_sod()) / 60, 1); p = put_str(p, " MIN"); *p = 0; fb_text(1, 0, b);
+    card_name(CARDS, N_CARDS, sess.teacher_uid, nm);
+    p = put_str(b, "BY "); p = put_str(p, nm); *p = 0; fb_text(2, 0, b);
+    p = put_str(b, "PRESENT "); p = put_u(p, sess.n_att, 1);
+    p = put_str(p, "  LATE "); p = put_u(p, session_late_count(&sess), 1); *p = 0; fb_text(3, 0, b);
+    p = put_str(b, "INSIDE NOW "); p = put_u(p, (uint32_t)rf_count(), 1); *p = 0; fb_text(4, 0, b);
+  } else {
+    fb_text(1, 0, "NO CLASS RUNNING");
+    fb_text(2, 0, "TEACHER TAP STARTS");
+    if (sess.has_last) {
+      p = put_str(b, "LAST "); p = put_hhmm(p, sess.last_start); *p++ = '-'; p = put_hhmm(p, sess.last_end); *p = 0;
+      fb_text(3, 0, b);
+      p = put_str(b, "PRESENT "); p = put_u(p, sess.last_present, 1);
+      p = put_str(p, "  LATE "); p = put_u(p, sess.last_late, 1); *p = 0; fb_text(4, 0, b);
+    } else fb_text(3, 0, "LAST: NONE YET");
+  }
+  p = put_str(b, "LATE AFTER "); p = put_u(p, late_min, 1); p = put_str(p, " MIN"); *p = 0; fb_text(5, 0, b);
+  if (late_pick <= 30 && late_pick != late_min) {
+    p = put_str(b, "KNOB: "); p = put_u(p, late_pick, 1); p = put_str(p, " MIN ?"); *p = 0; fb_text(6, 0, b);
+  }
+  draw_hint("KNOB:SET  SEL:SAVE");
+}
+
+static void draw_graph(const view_t *v) {
+  static const char *const GN[3] = { "TEMP ", "HUM ", "PEOPLE " };
+  const hist_t *h = graph_hold ? &graph_snap[graph_kind] : &hist[graph_kind];
+  char b[24], *p;
+  p = put_str(b, GN[graph_kind]);
+  if (graph_kind == 2) p = put_u(p, (uint32_t)rf_count(), 1);
+  else if (!v->dht_ok) p = put_str(p, "--");
+  else { p = put_u(p, graph_kind ? v->hum : v->temp, 1); *p++ = graph_kind ? '%' : 'C'; }
+  *p = 0;
+  char r[12];
+  if (graph_hold) put_str(r, "HOLD")[0] = 0;
+  else { char *q = put_u(r, (uint32_t)h->count * (HIST_PERIOD_US / 1000000UL) / 60, 1); put_str(q, " MIN")[0] = 0; }
+  draw_title(b, r);
+  uint8_t lo = 0, hi = 2;
+  bool ok;
+  if (graph_kind == 2) {                    /* people: always from 0 */
+    ok = h->count > 0;
+    for (int i = 0; i < h->count; i++) { uint8_t x = hist_get(h, i); if (x != HIST_GAP && x > hi) hi = x; }
+  } else ok = hist_range(h, 4, &lo, &hi);
+  if (!ok) { fb_text(4, 5, "NO DATA YET"); return; }
+  p = put_u(b, hi, 1); *p = 0; fb_text(1, 0, b);
+  p = put_u(b, lo, 1); *p = 0; fb_text(7, 0, b);
+  for (int y = 8; y < 64; y += 2) fb_pixel(19, y);   /* dotted y axis */
+  int prev = -1;
+  for (int i = 0; i < h->count; i++) {               /* newest sample at the right edge */
+    uint8_t x = hist_get(h, i);
+    int px = 128 - h->count + i;
+    if (x == HIST_GAP) { prev = -1; continue; }
+    int y = 8 + graph_y(x, lo, hi, 56);
+    if (prev < 0) fb_pixel(px, y); else fb_vline(px, prev, y);
+    prev = y;
+  }
+}
+
+static void ui_render(const view_t *v) {
+  fb_clear();
+  switch (scr) {
+  case SCR_HOME:   draw_home(v);  break;
+  case SCR_ROSTER: draw_roster(); break;
+  case SCR_LOG:    draw_log();    break;
+  case SCR_CLASS:  draw_class();  break;
+  case SCR_GRAPH:  draw_graph(v); break;
+  default: break;
+  }
+  fb_flush();
+}
+#endif
+
+static uint32_t stale_limit_ms(void) {
+#if FEATURES
+  if (sess.active) return STALE_CLASS_MS;
+#endif
+  return STALE_RESET_MS;
 }
 
 int main(void) {
@@ -836,11 +1412,17 @@ int main(void) {
   uint32_t pending_since[2] = {0, 0};
   bool stale_timing = false;
   uint32_t stale_since = 0;
+#if !FEATURES
   char line[24];
+#endif
   ovr_t ovr = OVR_AUTO;
   uint32_t btn_seen = btn_presses;
   uint16_t bright = BRIGHT_MAX;
   static const char *OVR_TXT[3] = { "AUTO", "ON", "OFF" };
+#if FEATURES
+  uint32_t mode_seen = mode_presses, sel_seen = sel_presses;
+  uint32_t last_hist = micros();
+#endif
 
   for (;;) {
     for (int z = 0; z < 2; z++) { cm[z] = read_cm(z); wait_poll(PING_GAP_MS); }
@@ -848,8 +1430,12 @@ int main(void) {
     if (micros() - last_dht >= DHT_PERIOD_US) {
       last_dht = micros();
       dht_ok = dht11_read(&temp, &hum);
-      if (!oled_addr && oled_probe_and_init())
+      if (!oled_addr && oled_probe_and_init()) {
         for (uint8_t p = 0; p < 8; p++) oled_line(p, "");
+#if FEATURES
+        fb_invalidate();                    /* display came back: resend every page */
+#endif
+      }
       rf.ok = rf.ok ? rc_present() : rc522_init();   /* notice a reader that was unplugged or plugged in */
     }
 
@@ -861,8 +1447,19 @@ int main(void) {
       btn_seen = presses;
       uart_time(); uart_puts("Button: override "); uart_puts(OVR_TXT[ovr]); uart_puts("\r\n");
     }
+#if FEATURES
+    { uint32_t m = mode_presses; while (mode_seen != m) { mode_seen++; ui_next_screen(); } }
+    { uint32_t q = sel_presses;  while (sel_seen != q)  { sel_seen++;  ui_select(); } }
+#endif
 #if USE_POT
-    { uint16_t v; if (adc_read(0, &v)) bright = pot_brightness(v, bright); }
+    { uint16_t v;
+      if (adc_read(0, &v)) {
+#if FEATURES
+        ui_knob(v, &bright);                /* HOME: brightness. Other screens: menu knob */
+#else
+        bright = pot_brightness(v, bright);
+#endif
+      } }
 #endif
 #if USE_FAN_POT
     { uint16_t v; if (adc_read(4, &v)) knob = fan_knob(v, knob); }
@@ -884,8 +1481,7 @@ int main(void) {
         pending_since[z] = 0;
       }
       if (occ[z]) occ_n++;
-      bool occ_eff = occ[z] || boost;               /* a recent tap-in counts as "someone is here" */
-
+      bool occ_eff = occ[z];                        /* lights follow the zone sensors only */
 
       led_set(z, led_duty(ovr, mode[z], occ_eff, dark, bright, LED_DIM));
     }
@@ -897,16 +1493,33 @@ int main(void) {
     /* Everyone tapped in but the room has been empty for ages: they left without tapping out. */
     if (rf_count() > 0 && occ_n == 0 && !boost) {
       if (!stale_timing) { stale_timing = true; stale_since = micros(); }
-      else if (micros() - stale_since >= STALE_RESET_MS * 1000UL) {
+      else if (micros() - stale_since >= stale_limit_ms() * 1000UL) {
         roster_clear(&rf.roster);
         rf.last_txt = "RESET";
         stale_timing = false;
         uart_puts("RFID roster cleared: zones empty too long\r\n");
+#if FEATURES
+        { uint32_t t = now_sod(); log_push(&evlog, t, 0, EV_RESET); class_stop(t); }
+#endif
       }
     } else {
       stale_timing = false;
     }
 
+#if FEATURES
+    if (micros() - last_hist >= HIST_PERIOD_US) {  /* graph samples */
+      last_hist = micros();
+      hist_push(&hist[0], dht_ok ? temp : HIST_GAP);
+      hist_push(&hist[1], dht_ok ? hum : HIST_GAP);
+      hist_push(&hist[2], (uint8_t)rf_count());
+    }
+    summary_flush();
+    {
+      view_t v = { { cm[0], cm[1] }, { occ[0], occ[1] }, occ_n, dark, dht_ok, temp, hum,
+                   bright, fan_now, ovr };
+      ui_render(&v);
+    }
+#else
     oled_line(0, dark ? "LIGHT: DARK" : "LIGHT: BRIGHT");
     rfid_service();
     {
@@ -948,6 +1561,7 @@ int main(void) {
     else put_str(line, "RFID NOT FOUND")[0] = 0;
     oled_line(7, line);
     rfid_service();
+#endif
 
     serial_service();
     if (rx_any && micros() - rx_last_us < RX_QUIET_US) goto heartbeat;   /* you are typing: keep the terminal clean */
@@ -970,6 +1584,9 @@ int main(void) {
     uart_puts("  OVR="); uart_puts(OVR_TXT[ovr]);
     uart_puts(" BRT="); uart_putu((uint32_t)bright * 100 / BRIGHT_MAX); uart_putc('%');
     uart_puts(" FAN="); uart_putu(fan_now); uart_putc('%');
+#if FEATURES
+    if (sess.active) uart_puts("  CLASS=LIVE");
+#endif
     uart_puts(oled_addr ? "  OLED=ok\r\n" : "  OLED=none\r\n");
 
 heartbeat:

@@ -5,8 +5,13 @@ door, light dimmer pot, on-chip RTC clock, manual override button, **one fan
 motor (IRLZ44N, 9 V battery) with its own speed pot, running only while
 someone is tapped in on the RFID**.
 
-Bare-metal CMSIS, no HAL. HSI 16 MHz, no PLL. Two interrupts (button EXTI,
-USART2 RX); everything else is polled.
+Bare-metal CMSIS, no HAL. HSI 16 MHz, no PLL. Interrupts: buttons (EXTI15_10,
+plus EXTI9_5 in v2) and USART2 RX; everything else is polled.
+
+**v2 (`FEATURES 1`, the default):** two extra buttons, five screens, card
+names, teacher sessions with LATE marking, an event log and OLED graphs. See
+"v2: screens, buttons, teacher sessions" below. `FEATURES 0` builds the v1
+screen and behaviour (tag `v1-final` / `smart-classroom-v1-final.zip`).
 
 Two zones instead of three: less wiring and lower cost per classroom.
 
@@ -33,6 +38,8 @@ on the ST morpho headers; find them in the pin table of ST's UM1724.
 | **Fan speed pot (10k)** | wiper (middle) / ends | **A2 (PA4)** / 3V3 and GND |
 | **Fan gate** | via 220 ohm, 10k gate to GND | **D7 (PA8)**, TIM1_CH1 |
 | RTC | | inside the STM32. Nothing to wire |
+| **MODE button** (v2) | one leg / other leg | **D6 (PB10)** / GND. Internal pull-up, no resistor |
+| **SELECT button** (v2) | one leg / other leg | **D11 (PA7)** / GND. Internal pull-up, no resistor |
 
 All grounds common.
 ECHO pins are 5V tolerant, no divider needed.
@@ -46,7 +53,7 @@ Set `ZONE_A_MODE` / `ZONE_B_MODE` at the top of `main.c` and reflash.
 | Value | Mode | LED |
 |---|---|---|
 | 0 | OFF | always off |
-| 1 | AUTO | on only if zone occupied (or entry boost) **and** dark |
+| 1 | AUTO | on only if zone occupied **and** dark |
 | 2 | DIM | ~10% always (never brighter than the pot) |
 | 3 | MAX | on always |
 
@@ -136,12 +143,15 @@ Tap a card on the RC522 as you enter or leave.
   The OLED line 2 shows `IN:<headcount> <last UID> <IN|OUT|DENY|FULL>`.
 - A card resting on the reader counts once (same card ignored for 3 s after
   each sighting, `TAP_LOCKOUT_MS`).
-- A tap-in makes **both zones count as occupied for 30 s** (`ENTRY_BOOST_MS`), so
-  the lights react at the door without waiting for the 5 s debounce.
-  After that the ultrasonic sensors take over.
+- Taps do **not** switch lights. Lights follow the zone sensors only; the
+  headcount drives the fan. (An earlier build also lit both zones for 30 s
+  after a tap-in; that was removed.)
 - If everyone is "inside" but both zones have been empty for 2 minutes
   (`STALE_RESET_MS`), the roster is cleared. This repairs people forgetting to
-  tap out.
+  tap out. The timer does not start until 30 s after the last tap-in
+  (`ENTRY_BOOST_MS`), and in v2 it is 10 minutes while a class is live
+  (`STALE_CLASS_MS`), so a teacher standing outside both zones does not
+  end the class.
 - Up to 8 cards tracked at once. Only 4-byte UIDs (MIFARE Classic, the kit
   card and tag) are handled; 7-byte cards show `7B` and are ignored.
 - Restrict who counts: tap each card, read its UID off the UART
@@ -189,7 +199,7 @@ tested on a laptop, no board needed:
 gcc -Wall -Wextra -ICore/Inc tests/host_test.c -o host_test && ./host_test
 ```
 
-## Screen
+## Screen (v1, `FEATURES 0`)
 
 ```
 LIGHT: DARK
@@ -202,12 +212,67 @@ OCC1/2 AUTO L75 F60
 RFID OK V92
 ```
 
+## v2: screens, buttons, teacher sessions
+
+Three buttons, two knobs:
+
+| Control | Does |
+|---|---|
+| **MODE** (D6) | next screen: HOME -> ROSTER -> LOG -> CLASS -> GRAPH -> HOME |
+| **SELECT** (D11) | the action of the current screen (bottom line says what) |
+| **B1** (blue) | override AUTO -> ON -> OFF for lights and fan, as in v1, on any screen |
+| **Light knob** (A0) | HOME: brightness. Other screens: the menu knob (pick / scroll / set) |
+| **Fan knob** (A2) | always fan speed |
+
+Screens (row 0 is the inverted title bar, row 7 is the hint line; a
+SELECT result shows there for 2.5 s):
+
+| Screen | Shows | Light knob | SELECT |
+|---|---|---|---|
+| HOME | zones, last tap, T/H, light %, fan %, class status | brightness | shows a hint |
+| ROSTER | everyone inside: name, time in, `T` teacher, `L` late | picks a row | press twice within 3 s: force that person OUT |
+| LOG | last 32 events, newest first: time, name, IN/OUT/LATE/START/END/DENY/FULL/FORCE/RESET | scrolls | prints the whole log as CSV on serial |
+| CLASS | live: start time, minutes, present, late, inside now. Idle: last class summary | sets "late after" 0-30 min | saves it |
+| GRAPH | last 18 min of temperature, humidity or headcount, one sample per 10 s, auto-scaled | left = TEMP, middle = HUM, right = PEOPLE | freeze / unfreeze (`HOLD`) |
+
+**Brightness pickup.** When you come back to HOME the knob is wherever the
+menus left it. The lights keep their brightness and HOME shows `L75*` until
+the knob is turned to (or past) the current brightness; from then on it
+controls the lights again. Nothing jumps.
+
+**Teacher sessions.** Cards are named in `CARDS[]` in `main.c`; unnamed
+cards show as `C-` plus the last 4 hex digits of the UID. The teacher card
+is `62E26506`.
+
+- Teacher taps IN: a class starts (`START`). Students already inside are
+  on time.
+- A student's **first** entry more than "late after" minutes after the start
+  is `LATE`. Leaving and coming back keeps the first mark.
+- Teacher taps OUT (or is forced out, or the roster self-clears): the class
+  ends (`END`). Serial prints the summary and every student with first-in
+  time and on time / LATE.
+- Changing "late after" during a class applies to entries from then on.
+  It is kept in RTC backup register 1, so it survives a reset; a new flash
+  or a power cut returns it to 10 min.
+- Sessions only record attendance. Lights and fan behave exactly as without
+  a class.
+
+**Serial commands (v2):** `R` roster, `L` log as CSV, `S` class status and
+attendance, plus `T`, `D`, `?` as before.
+
+**Display.** v2 draws into a 1 KB copy of the screen and sends only the
+128-byte pages that changed, checking the RFID reader between pages.
+
 ## Debugging
 
 - UART2 via the ST-LINK virtual COM port, 115200:
-  `[08:30:12] A=45(OCC) AUT  B=FAR      AUT  LDR=DARK  T=30 H=65  IN=2(boost)  RFID=ok  OVR=AUTO BRT=75% FAN=60%  OLED=ok`
+  `[08:30:12] A=45(OCC) AUT  B=FAR      AUT  LDR=DARK  T=30 H=65  IN=2(boost)  RFID=ok  OVR=AUTO BRT=75%  OLED=ok`
   Card taps and button presses print their own timestamped lines:
   `[08:30:14] RFID 3A4B5C6D IN inside=2`, `[08:31:02] Button: override ON`.
+  v2 adds the card name and class events:
+  `[09:02:00] RFID 62E26506 TEACHER IN CLASS START  inside=2`.
+- v2 MODE/SELECT do nothing: check D6/D11 go to GND through the button.
+  The pins use internal pull-ups; a button wired to 3V3 will never register.
 - LD2 toggles every loop = firmware alive.
 - `NO ECHO`: sensor never answered, check its TRIG/ECHO/5V wiring.
 - `FAR`: sensor works, nothing within ~4 m.
