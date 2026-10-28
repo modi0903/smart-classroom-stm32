@@ -16,8 +16,8 @@
  * FAN     PA8 (D7)  TIM1_CH1 -> 220R -> IRLZ44N gate (10k gate-GND), 20 kHz PWM.
  *         Motor on the 9 V battery, 1N4007 across it, battery (-) to Nucleo GND.
  * BUTTON  B1 (blue, on the board), PC13, EXTI line 13 interrupt
- * MODE    PB10 (D6),  push button to GND, EXTI line 10   } FEATURES build only
- * SELECT  PA7  (D11), push button to GND, EXTI line 7    } internal pull-ups
+ * UI BTN  PA7 (D11), push button to GND, EXTI line 7, internal pull-up (FEATURES only):
+ *         tap = next screen, hold 2 s = select
  * HC-SR04 on 5V, everything else 3V3, grounds common.
  *
  * Each zone's mode (OFF/AUTO/DIM/MAX) is a #define below; the pot sets how
@@ -29,16 +29,18 @@
  * at the door toggles that card in/out of the headcount. Lights follow the
  * zone sensors only; the headcount drives the fan.
  *
- * FEATURES 1 (v2) adds: MODE/SELECT buttons and five screens (HOME, ROSTER,
- * LOG, CLASS, GRAPH), the light pot doubling as a menu knob off HOME, card
- * names, teacher sessions with LATE marking, an event log and OLED graphs.
+ * FEATURES 1 (v2) adds: one UI button and five screens (HOME, ROSTER, LOG,
+ * CLASS, GRAPH), the light pot doubling as a menu knob off HOME, card names,
+ * teacher sessions with LATE marking, an event log and OLED graphs. In v2 the
+ * blue button steps the fan level 0 -> 33 -> 66 -> 100 -> 0 (no override,
+ * no fan pot); lights run on the zone mode (AUTO: occupied and dark).
  * FEATURES 0 builds the v1 behaviour and screen.
  *
  * Clock: on-chip RTC, 32.768 kHz LSE crystal (falls back to the rough LSI if
  * the crystal is missing). Set from the build time on flashing; set it exactly
  * over the serial port with "T 08:30:00" and "D 18/10/26".
  *
- * Interrupts: EXTI15_10 (buttons), EXTI9_5 (SELECT, v2) and USART2 RX (serial commands). Everything
+ * Interrupts: EXTI15_10 (blue button), EXTI9_5 (UI button, v2) and USART2 RX (serial commands). Everything
  * else is polled. HSI 16MHz, no PLL. UART2 prints raw state every loop and
  * LD2 toggles as a heartbeat. Pure logic lives in logic.h (host tested).
  */
@@ -62,7 +64,11 @@
 #define USE_POT     1   /* 0 until the pot is wired, or A0 floats and brightness wanders */
 #endif
 #ifndef USE_FAN_POT
+#if FEATURES
+#define USE_FAN_POT 0   /* v2: fan speed comes from the blue button, A2 is not read */
+#else
 #define USE_FAN_POT 1   /* fan speed knob on A2. 0 = fan runs at full allowed speed when on */
+#endif
 #endif
 
 #define OCC_CM      100
@@ -83,7 +89,7 @@
 #define LATE_MIN_DEFAULT 10          /* v2: minutes after the teacher's tap before LATE */
 #define HIST_PERIOD_US 10000000UL    /* v2: one graph sample every 10 s, 108 samples = 18 min */
 #define BTN_QUIET_US   30000UL       /* v2 buttons: an edge counts only after 30 ms of quiet */
-#define CONFIRM_US     3000000UL     /* v2: second SELECT within this to confirm */
+#define HOLD_US        2000000UL     /* v2: UI button held this long = select */
 #define TOAST_US       2500000UL     /* v2: how long a status message stays on the bottom line */
 
 #define DIST_NO_ECHO 0xFFFE
@@ -103,8 +109,7 @@ static const pin_t LDR  = {GPIOB, 0};
 static const pin_t RC_CS  = {GPIOB, 12};    /* RC522 SDA/SS, software chip select */
 static const pin_t RC_RST = {GPIOC, 5};
 #if FEATURES
-static const pin_t BTN_MODE = {GPIOB, 10};   /* D6  */
-static const pin_t BTN_SEL  = {GPIOA, 7};    /* D11 */
+static const pin_t BTN_UI = {GPIOA, 7};      /* D11: tap = next screen, hold = select */
 
 /* Card names. UIDs are printed on the serial log when a card is tapped.
  * Names longer than 8 characters are cut on the OLED. */
@@ -173,11 +178,13 @@ static volatile bool     rx_any;             /* anything typed since boot */
 static volatile uint32_t btn_presses;
 static volatile uint32_t btn_last_us;
 #if FEATURES
-/* MODE and SELECT: same idea, but the ISR sees both edges and counts a press
- * only on a falling edge that follows 30 ms of quiet. Contact bounce (on
- * press and on release) always comes in quick bursts, so it is rejected. */
-static volatile uint32_t mode_presses, sel_presses;
-static volatile uint32_t mode_edge_us, sel_edge_us;
+/* UI button: the ISR sees both edges. An edge counts only after 30 ms of
+ * quiet, so contact bounce (always a quick burst) is ignored. Press = pin
+ * low, release = pin high. A release before HOLD_US is a tap (next screen);
+ * the main loop fires "select" once the button has been held HOLD_US. */
+static volatile uint32_t ui_taps;
+static volatile uint32_t ui_edge_us, ui_down_us;
+static volatile bool     ui_down, ui_long_done;
 #endif
 
 void USART2_IRQHandler(void) {
@@ -197,24 +204,20 @@ void EXTI15_10_IRQHandler(void) {
     EXTI->PR = (1U << 13);                   /* write 1 to clear the pending flag */
     if (now - btn_last_us >= BTN_DEBOUNCE_US) { btn_presses++; btn_last_us = now; }
   }
-#if FEATURES
-  if (EXTI->PR & (1U << 10)) {               /* MODE on PB10 */
-    EXTI->PR = (1U << 10);
-    bool quiet = (now - mode_edge_us) >= BTN_QUIET_US;
-    mode_edge_us = now;
-    if (quiet && !(GPIOB->IDR & (1U << 10))) mode_presses++;
-  }
-#endif
 }
 
 #if FEATURES
 void EXTI9_5_IRQHandler(void) {
-  if (EXTI->PR & (1U << 7)) {                /* SELECT on PA7 */
+  if (EXTI->PR & (1U << 7)) {                /* UI button on PA7 */
     EXTI->PR = (1U << 7);
     uint32_t now = TIM2->CNT;
-    bool quiet = (now - sel_edge_us) >= BTN_QUIET_US;
-    sel_edge_us = now;
-    if (quiet && !(GPIOA->IDR & (1U << 7))) sel_presses++;
+    bool quiet = (now - ui_edge_us) >= BTN_QUIET_US;
+    ui_edge_us = now;
+    if (quiet) {
+      bool low = !(GPIOA->IDR & (1U << 7));
+      if (low && !ui_down) { ui_down = true; ui_down_us = now; ui_long_done = false; }
+      else if (!low && ui_down) { ui_down = false; if (!ui_long_done) ui_taps++; }
+    }
   }
 }
 #endif
@@ -240,16 +243,14 @@ static void button_init(void) {
 
 #if FEATURES
 static void buttons2_init(void) {           /* after button_init: SYSCFG clock is on */
-  pin_mode(BTN_MODE, 0); pin_pull(BTN_MODE, 1);
-  pin_mode(BTN_SEL, 0);  pin_pull(BTN_SEL, 1);
-  SYSCFG->EXTICR[2] = (SYSCFG->EXTICR[2] & ~SYSCFG_EXTICR3_EXTI10) | SYSCFG_EXTICR3_EXTI10_PB;
+  pin_mode(BTN_UI, 0); pin_pull(BTN_UI, 1);
   SYSCFG->EXTICR[1] &= ~SYSCFG_EXTICR2_EXTI7;          /* 0 = port A */
-  uint32_t m = (1U << 10) | (1U << 7);
+  uint32_t m = (1U << 7);
   EXTI->FTSR |= m;                           /* both edges: see the ISR */
   EXTI->RTSR |= m;
   EXTI->PR    = m;
   EXTI->IMR  |= m;
-  NVIC_EnableIRQ(EXTI9_5_IRQn);              /* EXTI15_10 is already enabled */
+  NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 #endif
 
@@ -1067,7 +1068,6 @@ static void fb_flush(void) {
 
 typedef enum { SCR_HOME, SCR_ROSTER, SCR_LOG, SCR_CLASS, SCR_GRAPH, SCR_COUNT } scr_t;
 static const char *const SCR_NAME[SCR_COUNT] = { "HOME", "ROSTER", "LOG", "CLASS", "GRAPH" };
-static const char *const OVR_NAME[3] = { "AUTO", "ON", "OFF" };
 
 static scr_t    scr = SCR_HOME;
 static uint8_t  pick = 255;                 /* knob-chosen row (ROSTER) or scroll (LOG) */
@@ -1075,7 +1075,6 @@ static uint8_t  late_pick = 255;            /* knob value on CLASS, 0..30 min */
 static uint8_t  graph_kind;                 /* 0 temp, 1 humidity, 2 people */
 static bool     graph_hold;
 static hist_t   graph_snap[3];
-static uint32_t confirm_uid, confirm_t0;    /* ROSTER: first SELECT arms, second confirms */
 static char     toast[22];
 static uint32_t toast_t0;
 static bool     toast_on;
@@ -1084,7 +1083,7 @@ static pickup_t bright_pick;
 typedef struct {                            /* what the screens need from main() */
   uint16_t cm[2]; bool occ[2]; int occ_n;
   bool dark, dht_ok; uint8_t temp, hum;
-  uint16_t bright; uint8_t fan; ovr_t ovr;
+  uint16_t bright; uint8_t fan; uint8_t fan_lvl;
 } view_t;
 
 static char *put_hhmm(char *b, uint32_t sod) {
@@ -1155,15 +1154,14 @@ static bool feature_command(char op) {
 static void ui_next_screen(void) {
   if (scr == SCR_HOME) pickup_hold(&bright_pick);    /* knob leaves the lights */
   scr = (scr_t)((scr + 1) % SCR_COUNT);
-  pick = 255; late_pick = 255; confirm_uid = 0; toast_on = false;
+  pick = 255; late_pick = 255; toast_on = false;
 }
 
 static void ui_select(void) {
-  uint32_t now = micros();
   char nm[9], b[22], *p;
   switch (scr) {
   case SCR_HOME:
-    set_toast("MODE = NEXT SCREEN", 0);
+    set_toast("TAP=NEXT HOLD=SELECT", 0);
     break;
   case SCR_ROSTER: {
     int sl[ROSTER_MAX], n = roster_inside(&rf.roster, sl);
@@ -1171,7 +1169,7 @@ static void ui_select(void) {
     int slot = sl[pick < n ? pick : n - 1];
     uint32_t uid = rf.roster.e[slot].uid;
     card_name(CARDS, N_CARDS, uid, nm);
-    if (confirm_uid == uid && now - confirm_t0 < CONFIRM_US) {
+    {                                       /* the 2 s hold is the confirmation */
       uint32_t t = now_sod();
       roster_force_out(&rf.roster, slot);
       log_push(&evlog, t, uid, EV_FORCE);
@@ -1179,11 +1177,7 @@ static void ui_select(void) {
       if (sess.active && uid == sess.teacher_uid) class_stop(t);
       if (rf_count() == 0) rf.boost_on = false;
       rf.last_uid = uid; rf.last_txt = "FORCE";
-      confirm_uid = 0;
       set_toast("OUT: ", nm);
-    } else {
-      confirm_uid = uid; confirm_t0 = now;
-      set_toast("AGAIN=OUT ", nm);
     }
     break; }
   case SCR_LOG:
@@ -1262,8 +1256,8 @@ static void draw_home(const view_t *v) {
   p = put_str(p, v->dark ? "DARK" : "BRIGHT"); *p = 0; fb_text(4, 0, b);
   p = put_str(b, "L"); p = put_u(p, (uint32_t)v->bright * 100 / BRIGHT_MAX, 1);
   if (bright_pick.held) *p++ = '*';                     /* knob not in control yet */
-  p = put_str(p, " F"); p = put_u(p, v->fan, 1);
-  p = put_str(p, " OVR:"); p = put_str(p, OVR_NAME[v->ovr]); *p = 0; fb_text(5, 0, b);
+  p = put_str(p, " FAN:"); p = put_u(p, v->fan_lvl, 1);
+  p = put_str(p, v->fan ? " RUN" : " STOP"); *p = 0; fb_text(5, 0, b);
   if (sess.active) {
     p = put_str(b, "CLASS "); p = put_u(p, sod_elapsed(sess.start_sod, now_sod()) / 60, 1);
     p = put_str(p, "M P"); p = put_u(p, sess.n_att, 1); p = put_str(p, " L"); p = put_u(p, session_late_count(&sess), 1);
@@ -1278,7 +1272,6 @@ static void draw_home(const view_t *v) {
 static void draw_roster(void) {
   char b[24], nm[9], *p;
   int sl[ROSTER_MAX], n = roster_inside(&rf.roster, sl);
-  if (confirm_uid && micros() - confirm_t0 >= CONFIRM_US) confirm_uid = 0;
   p = put_u(b, (uint32_t)n, 1); p = put_str(p, " IN"); *p = 0;
   draw_title(SCR_NAME[SCR_ROSTER], b);
   if (!n) fb_text(3, 4, "NOBODY INSIDE");
@@ -1296,7 +1289,7 @@ static void draw_roster(void) {
     fb_text((uint8_t)(1 + k), 0, b);
     if (i == cur) fb_invert_row((uint8_t)(1 + k));
   }
-  draw_hint("KNOB:PICK  SEL:OUT");
+  draw_hint("KNOB:PICK HOLD:OUT");
 }
 
 static void draw_log(void) {
@@ -1312,7 +1305,7 @@ static void draw_log(void) {
     p = put_hhmm(b, e->sod); *p++ = ' '; p = put_pad(p, nm, 8); *p++ = ' '; p = put_str(p, ev_txt(e->type)); *p = 0;
     fb_text((uint8_t)(1 + k), 0, b);
   }
-  draw_hint("KNOB:SCROLL SEL:CSV");
+  draw_hint("KNOB:SCRL HOLD:CSV");
 }
 
 static void draw_class(void) {
@@ -1340,7 +1333,7 @@ static void draw_class(void) {
   if (late_pick <= 30 && late_pick != late_min) {
     p = put_str(b, "KNOB: "); p = put_u(p, late_pick, 1); p = put_str(p, " MIN ?"); *p = 0; fb_text(6, 0, b);
   }
-  draw_hint("KNOB:SET  SEL:SAVE");
+  draw_hint("KNOB:SET HOLD:SAVE");
 }
 
 static void draw_graph(const view_t *v) {
@@ -1375,6 +1368,25 @@ static void draw_graph(const view_t *v) {
     if (prev < 0) fb_pixel(px, y); else fb_vline(px, prev, y);
     prev = y;
   }
+}
+
+/* Called once per loop pass. Fires "select" once the UI button has been held
+ * HOLD_US, and re-syncs with the pin if the ISR's bounce filter ever left the
+ * state wrong (line quiet for 50 ms: the pin level is the truth). */
+static void ui_button_poll(void) {
+  uint32_t now = micros();
+  bool low = !pin_rd(BTN_UI);
+  __disable_irq();
+  if (now - ui_edge_us > 50000UL) {
+    if (low && !ui_down) { ui_down = true; ui_down_us = ui_edge_us; ui_long_done = false; }
+    else if (!low && ui_down) { ui_down = false; if (!ui_long_done) ui_taps++; }
+  }
+  bool fire = ui_down && !ui_long_done && (now - ui_down_us >= HOLD_US);
+  if (fire) ui_long_done = true;
+  bool holding = ui_down && !ui_long_done && (now - ui_down_us >= 400000UL);
+  __enable_irq();
+  if (fire) ui_select();
+  else if (holding) set_toast("KEEP HOLDING...", 0);
 }
 
 static void ui_render(const view_t *v) {
@@ -1418,10 +1430,13 @@ int main(void) {
   ovr_t ovr = OVR_AUTO;
   uint32_t btn_seen = btn_presses;
   uint16_t bright = BRIGHT_MAX;
+#if !FEATURES
   static const char *OVR_TXT[3] = { "AUTO", "ON", "OFF" };
+#endif
 #if FEATURES
-  uint32_t mode_seen = mode_presses, sel_seen = sel_presses;
+  uint32_t tap_seen = ui_taps;
   uint32_t last_hist = micros();
+  uint8_t  fan_level = 0;                   /* blue button: 0 -> 33 -> 66 -> 100 -> 0 */
 #endif
 
   for (;;) {
@@ -1443,13 +1458,20 @@ int main(void) {
 
     uint32_t presses = btn_presses;                 /* one read: the ISR may bump it any time */
     if (presses != btn_seen) {
+#if FEATURES
+      fan_level = (uint8_t)((fan_level + (presses - btn_seen)) % FAN_LEVELS);
+      btn_seen = presses;
+      uart_time(); uart_puts("Button: fan level "); uart_putu(fan_level_shown(fan_level)); uart_puts("%\r\n");
+#else
       ovr = (ovr_t)((ovr + (presses - btn_seen)) % 3);
       btn_seen = presses;
       uart_time(); uart_puts("Button: override "); uart_puts(OVR_TXT[ovr]); uart_puts("\r\n");
+#endif
     }
 #if FEATURES
-    { uint32_t m = mode_presses; while (mode_seen != m) { mode_seen++; ui_next_screen(); } }
-    { uint32_t q = sel_presses;  while (sel_seen != q)  { sel_seen++;  ui_select(); } }
+    { uint32_t t = ui_taps; while (tap_seen != t) { tap_seen++; ui_next_screen(); } }
+    ui_button_poll();
+    knob = fan_level_drive(fan_level);      /* fan speed from the blue button */
 #endif
 #if USE_POT
     { uint16_t v;
@@ -1516,7 +1538,7 @@ int main(void) {
     summary_flush();
     {
       view_t v = { { cm[0], cm[1] }, { occ[0], occ[1] }, occ_n, dark, dht_ok, temp, hum,
-                   bright, fan_now, ovr };
+                   bright, fan_now, fan_level_shown(fan_level) };
       ui_render(&v);
     }
 #else
@@ -1581,7 +1603,11 @@ int main(void) {
     else uart_puts("DHT=ERR");
     uart_puts("  IN="); uart_putu((uint32_t)rf_count()); uart_puts(boost ? "(boost)" : "");
     uart_puts(rf.ok ? "  RFID=ok" : "  RFID=none");
+#if FEATURES
+    uart_puts("  FANLVL="); uart_putu(fan_level_shown(fan_level));
+#else
     uart_puts("  OVR="); uart_puts(OVR_TXT[ovr]);
+#endif
     uart_puts(" BRT="); uart_putu((uint32_t)bright * 100 / BRIGHT_MAX); uart_putc('%');
     uart_puts(" FAN="); uart_putu(fan_now); uart_putc('%');
 #if FEATURES

@@ -8,8 +8,9 @@ someone is tapped in on the RFID**.
 Bare-metal CMSIS, no HAL. HSI 16 MHz, no PLL. Interrupts: buttons (EXTI15_10,
 plus EXTI9_5 in v2) and USART2 RX; everything else is polled.
 
-**v2 (`FEATURES 1`, the default):** two extra buttons, five screens, card
-names, teacher sessions with LATE marking, an event log and OLED graphs. See
+**v2 (`FEATURES 1`, the default):** one extra button, five screens, card
+names, teacher sessions with LATE marking, an event log and OLED graphs. The
+blue button sets the fan level (the fan pot is not used in v2). See
 "v2: screens, buttons, teacher sessions" below. `FEATURES 0` builds the v1
 screen and behaviour (tag `v1-final` / `smart-classroom-v1-final.zip`).
 
@@ -38,8 +39,8 @@ on the ST morpho headers; find them in the pin table of ST's UM1724.
 | **Fan speed pot (10k)** | wiper (middle) / ends | **A2 (PA4)** / 3V3 and GND |
 | **Fan gate** | via 220 ohm, 10k gate to GND | **D7 (PA8)**, TIM1_CH1 |
 | RTC | | inside the STM32. Nothing to wire |
-| **MODE button** (v2) | one leg / other leg | **D6 (PB10)** / GND. Internal pull-up, no resistor |
-| **SELECT button** (v2) | one leg / other leg | **D11 (PA7)** / GND. Internal pull-up, no resistor |
+| **UI button** (v2) | one leg / other leg | **D11 (PA7)** / GND. Internal pull-up, no resistor |
+| Fan speed pot (v2) | | not used in v2; leave A2 unconnected or wired, it is not read |
 
 All grounds common.
 ECHO pins are 5V tolerant, no divider needed.
@@ -179,6 +180,12 @@ debounced state.
 
 ## Build, test, flash
 
+Self-contained project: `CMakeLists.txt`, `cmake/gcc-arm-none-eabi.cmake`,
+`STM32F401RETX_FLASH.ld`, ST's `startup_stm32f401xe.s` and
+`system_stm32f4xx.c` are all included. Needs `arm-none-eabi-gcc`, CMake,
+Ninja and `STM32_Programmer_CLI` on PATH. From this folder, `flash.bat`
+alone configures (first time), builds and flashes.
+
 ```
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake
 flash.bat
@@ -214,23 +221,32 @@ RFID OK V92
 
 ## v2: screens, buttons, teacher sessions
 
-Three buttons, two knobs:
+Two buttons, one knob:
 
 | Control | Does |
 |---|---|
-| **MODE** (D6) | next screen: HOME -> ROSTER -> LOG -> CLASS -> GRAPH -> HOME |
-| **SELECT** (D11) | the action of the current screen (bottom line says what) |
-| **B1** (blue) | override AUTO -> ON -> OFF for lights and fan, as in v1, on any screen |
+| **UI button** (D11), tap | next screen: HOME -> ROSTER -> LOG -> CLASS -> GRAPH -> HOME (on release) |
+| **UI button** (D11), hold 2 s | SELECT: the action of the current screen. `KEEP HOLDING...` shows while you hold; it fires at 2 s without waiting for release, and releasing after that does not change screen |
+| **B1** (blue) | fan level 0 -> 33 -> 66 -> 100 -> 0, on any screen |
 | **Light knob** (A0) | HOME: brightness. Other screens: the menu knob (pick / scroll / set) |
-| **Fan knob** (A2) | always fan speed |
+
+**Fan (v2).** The level only sets the speed; the fan runs only while at
+least one card is tapped in (as before). The shown 33/66/100 are driven as
+35/68/100 % of the allowed speed, because the motor stalls below about 35 %,
+and the allowed speed is still capped at 60 % of the 9 V battery. Starts at 0
+after a reset, so press B1 once to choose a speed. HOME shows
+`FAN:66 RUN` or `FAN:66 STOP` (STOP = nobody tapped in).
+
+**Lights (v2).** No override any more. Each zone follows its mode (AUTO:
+on at the pot brightness when the zone is occupied and the room is dark).
 
 Screens (row 0 is the inverted title bar, row 7 is the hint line; a
 SELECT result shows there for 2.5 s):
 
 | Screen | Shows | Light knob | SELECT |
 |---|---|---|---|
-| HOME | zones, last tap, T/H, light %, fan %, class status | brightness | shows a hint |
-| ROSTER | everyone inside: name, time in, `T` teacher, `L` late | picks a row | press twice within 3 s: force that person OUT |
+| HOME | zones, last tap, T/H, light %, fan level, class status | brightness | shows a hint |
+| ROSTER | everyone inside: name, time in, `T` teacher, `L` late | picks a row | force that person OUT |
 | LOG | last 32 events, newest first: time, name, IN/OUT/LATE/START/END/DENY/FULL/FORCE/RESET | scrolls | prints the whole log as CSV on serial |
 | CLASS | live: start time, minutes, present, late, inside now. Idle: last class summary | sets "late after" 0-30 min | saves it |
 | GRAPH | last 18 min of temperature, humidity or headcount, one sample per 10 s, auto-scaled | left = TEMP, middle = HUM, right = PEOPLE | freeze / unfreeze (`HOLD`) |
@@ -271,8 +287,8 @@ attendance, plus `T`, `D`, `?` as before.
   `[08:30:14] RFID 3A4B5C6D IN inside=2`, `[08:31:02] Button: override ON`.
   v2 adds the card name and class events:
   `[09:02:00] RFID 62E26506 TEACHER IN CLASS START  inside=2`.
-- v2 MODE/SELECT do nothing: check D6/D11 go to GND through the button.
-  The pins use internal pull-ups; a button wired to 3V3 will never register.
+- v2 UI button does nothing: check D11 goes to GND through the button.
+  The pin uses an internal pull-up; a button wired to 3V3 will never register.
 - LD2 toggles every loop = firmware alive.
 - `NO ECHO`: sensor never answered, check its TRIG/ECHO/5V wiring.
 - `FAR`: sensor works, nothing within ~4 m.

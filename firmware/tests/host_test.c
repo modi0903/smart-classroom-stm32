@@ -295,6 +295,19 @@ static void test_session(void) {
   CHECK(s.n_att == ATT_MAX);
 }
 
+static void test_fan_level(void) {
+  CHECK(fan_level_shown(0) == 0 && fan_level_shown(1) == 33 && fan_level_shown(2) == 66 && fan_level_shown(3) == 100);
+  CHECK(fan_level_shown(4) == 0);                        /* wraps */
+  CHECK(fan_level_drive(0) == 0);
+  CHECK(fan_level_drive(1) >= FAN_MIN_PCT);              /* lowest step still turns the motor */
+  CHECK(fan_level_drive(1) < fan_level_drive(2) && fan_level_drive(2) < fan_level_drive(3));
+  CHECK(fan_level_drive(3) == 100);
+  /* through the existing chain: level 1 with someone inside, capped at 60 % */
+  CHECK(fan_cmd(OVR_AUTO, true, fan_level_drive(1)) == 35);
+  CHECK(fan_cmd(OVR_AUTO, false, fan_level_drive(3)) == 0);   /* nobody tapped in: off */
+  CHECK(fan_ccr(fan_level_drive(3), 60) == 480);
+}
+
 static void test_hist(void) {
   hist_t h = {0};
   uint8_t lo, hi;
@@ -322,7 +335,7 @@ static void test_hist(void) {
 int main(void) {
   test_pot(); test_led_duty(); test_datetime(); test_fan();
   test_roster(); test_roster_full(); test_roster_wrap(); test_allowed();
-  test_cards(); test_roster_helpers(); test_knob(); test_pickup(); test_log(); test_session(); test_hist();
+  test_cards(); test_roster_helpers(); test_knob(); test_pickup(); test_log(); test_session(); test_hist(); test_fan_level();
   printf("%d checks, %d failed\n", checks, fails);
   return fails ? 1 : 0;
 }

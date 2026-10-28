@@ -108,6 +108,21 @@ static inline bool pickup_update(pickup_t *p, int knob_val, int cur_val, int win
   return false;
 }
 
+/* ------------------------------------------------------------ fan level --
+ * v2: the blue button steps the fan 0 -> 33 -> 66 -> 100 -> 0 (shown values).
+ * The driven values start at 35 % because the motor stalls lower down; they
+ * are a share of the allowed speed (FAN_MAX_PCT caps the battery voltage).
+ */
+#define FAN_LEVELS 4
+static inline uint8_t fan_level_shown(uint8_t lvl) {
+  static const uint8_t v[FAN_LEVELS] = { 0, 33, 66, 100 };
+  return v[lvl % FAN_LEVELS];
+}
+static inline uint8_t fan_level_drive(uint8_t lvl) {
+  static const uint8_t v[FAN_LEVELS] = { 0, 35, 68, 100 };
+  return v[lvl % FAN_LEVELS];
+}
+
 /* ------------------------------------------------------------ event log -- */
 typedef enum { EV_IN, EV_LATE, EV_OUT, EV_DENY, EV_FULL,
                EV_START, EV_END, EV_FORCE, EV_RESET } ev_t;
