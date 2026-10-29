@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  firmware:
+    name: Firmware (arm-none-eabi-gcc)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi cmake ninja-build
+      - name: Configure
+        working-directory: firmware
+        run: cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake
+      - name: Build
+        working-directory: firmware
+        run: cmake --build build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleo_classroom
+          path: |
+            firmware/build/nucleo_classroom.elf
+            firmware/build/nucleo_classroom.hex
+
+  host-tests:
+    name: Host tests (logic.h, extras.h)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: gcc -Wall -Wextra -Werror -Ifirmware/Core/Inc firmware/tests/host_test.c -o host_test
+      - run: ./host_test
+
+  oled-sim:
+    name: PC simulator (screens, menu button)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -C tools/oled-sim
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oled-screens
+          path: tools/oled-sim/out/*.pgm

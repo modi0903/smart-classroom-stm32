@@ -1,0 +1,49 @@
+\documentclass[border=8pt]{standalone}
+\usepackage[T1]{fontenc}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{siunitx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc,fit,backgrounds}
+\usepackage[siunitx,american]{circuitikz}
+\usepackage{mathptmx}
+\definecolor{ink}{HTML}{14202B}
+\definecolor{slate}{HTML}{24394B}
+\definecolor{amber}{HTML}{C9781E}
+\definecolor{amberlight}{HTML}{FBEBD3}
+\definecolor{teal}{HTML}{3E7F8C}
+\definecolor{paper}{HTML}{F6F3EC}
+\definecolor{muted}{HTML}{5E6974}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\tikzset{
+  blk/.style={draw=slate,rounded corners=3pt,fill=white,align=center,font=\small,minimum height=0.9cm,text width=3.3cm},
+  hub/.style={draw=amber,line width=1.1pt,rounded corners=4pt,fill=amberlight,align=center,font=\small},
+  arr/.style={-{Stealth[length=2.2mm]},draw=slate,line width=0.7pt},
+  stp/.style={draw=slate,rounded corners=3pt,fill=white,align=center,font=\small,minimum height=1.1cm,text width=4.2cm},
+}
+
+\begin{document}
+\begin{circuitikz}[american]
+  % supply rail
+  \draw (6,7.4) node[above]{$+9$\,V (battery $+$)} to[short,o-] (6,6.6) -- (9,6.6);
+  % motor
+  \node[elmech] (mot) at (6,5.4) {M};
+  \draw (6,6.6) -- (mot.north) (mot.south) -- (6,4.2);
+  \node[left=8pt, align=right, font=\footnotesize] at (mot.west) {motor\\3--6\,V, type 130};
+  % flyback diode, cathode to +9 V
+  \draw (9,4.2) to[D] (9,6.6);
+  \node[right=12pt, align=left, font=\footnotesize] at (9,5.4) {$D_1$\\1N4007};
+  \draw (6,4.2) -- (9,4.2);
+  % MOSFET
+  \draw (6,4.2) -- (6,3.7) node[nigfete, anchor=D] (Q) {};
+  \node[right=6pt, align=left, font=\footnotesize] at (Q.east) {$Q_1$\\IRLZ44N};
+  \draw (Q.S) -- (6,1.4) node[ground]{};
+  % gate network
+  \draw (Q.G) -- ++(-1.0,0) coordinate(g);
+  \draw (g) to[R, l_=$220\,\Omega$, -o] ++(-3.2,0) coordinate(pin);
+  \node[left, align=right, font=\footnotesize] at (pin) {PA8 (D7)\\TIM1 CH1, 20\,kHz};
+  \draw (g) to[R, l^=$10\,\mathrm{k}\Omega$, *-] (g |- 6,1.4) node[ground]{};
+  \node[align=center,font=\footnotesize] at (2.3,0.6) {Nucleo GND and battery ($-$) share one ground};
+\end{circuitikz}
+\end{document}
