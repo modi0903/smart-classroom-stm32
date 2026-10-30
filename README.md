@@ -120,7 +120,7 @@ tools/oled-sim/      runs main.c on a PC: renders the screens, tests the button 
 | Member | Part |
 |---|---|
 | Tanmay Modi ([@modi0903](https://github.com/modi0903)) | System, sensing, firmware integration, user interface |
-| Tejaswi B Gowda | Motor driver and fan |
+| Tejaswi B Gowda ([@TBG06](https://github.com/TBG06)) | Motor driver and fan |
 | Ayush | RFID integration |
 | Tejas | DHT11 and RTC |
 
